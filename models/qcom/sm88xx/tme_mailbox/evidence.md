@@ -1455,8 +1455,18 @@ The OEM root is “OPLUS ROOT CA 1”.
 The `xbl_sc.elf` envelope contains the same intermediate and root certificates.
 The `xbl_config.elf` envelope contains the same three OEM certificates and no QTI certificate chain.
 Certificate identity and algorithm decoding do not establish successful firmware authentication.
-The exact normalized message for each envelope signature remains unproved.
-Simple contiguous header-plus-metadata-plus-hash verification did not establish that message.
+ROM `0x20617c` builds the signed message for each signer, and ROM `0x206268` restores the envelope after the check.
+The message is the authentication segment from offset zero to the end of the hash table.
+For a dual-signed envelope, the OEM view sets header words six and seven to zero and fills the QTI metadata with zeros.
+The QTI view sets header words eight and nine to zero and fills the OEM metadata with zeros.
+A single-signer envelope uses the message without change.
+Each signature is ECDSA P-384 with SHA-384 over its message.
+An offline host check accepted both `xbl_ac_config.mbn` signatures with this rule.
+The same check accepted every signature in the 84 v7 images of the selected package.
+It rejected both TZ signatures after a one-bit change in the TZ hash table.
+The OEM multi-image catalog digest is SHA-384 of the OEM-view message.
+For the QTI view, ROM `0x2069dc` also hashes a trailing block with magic `0x51424543`.
+The final images contain no such block, so the input of the QTI catalog digest remains unestablished.
 
 ### Model coverage and trust policy
 

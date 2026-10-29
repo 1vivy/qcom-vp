@@ -177,8 +177,12 @@ The startup class is separate from this input.
 Candidate `0x23119a..0x2311e4` classifies the word at `0x102f1004`.
 Bit four selects class one.
 Otherwise low-nibble values `0xc..0xe` select class two.
-Otherwise the candidate's helper at `0x2311e6` returns zero, which selects class three.
-The existing explicit zero startup word therefore selects class three, not an unselected class.
+Otherwise the candidate calls helper `0x2311e6` through donor slot `0x3d4`.
+A nonzero helper result stores class three at `0x2311c6`.
+The helper returns zero, so the branch at `0x2311e4` jumps to `0x2311ca` and skips that store.
+The cached class at `0x41d41c` therefore keeps its previous value.
+The existing explicit zero startup word therefore leaves class zero, not class three.
+The [runtime ABI evidence](../sm8845/tme_runtime_abi/evidence.md) independently observes class zero in `s2` at `0x43316e`.
 Legacy slot `0x308`, mapped to candidate slot `0x304`, returns that class through `0x23117c`.
 These observations do not establish silicon names for the reset bits.
 The control model neither changes that classification nor writes the class.
