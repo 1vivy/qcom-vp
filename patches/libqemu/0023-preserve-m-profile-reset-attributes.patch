@@ -1,0 +1,18 @@
+diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -345,8 +345,12 @@
+          * it got copied into memory. In the latter case, rom_ptr
+          * will return a NULL pointer and we should use ldl_phys instead.
+          */
+-        address_space_read(cs->as, vecbase, MEMTXATTRS_UNSPECIFIED, (uint8_t *)&initial_msp, 4);
+-        address_space_read(cs->as, vecbase + 4, MEMTXATTRS_UNSPECIFIED, (uint8_t *)&initial_pc, 4);
++        MemTxAttrs attrs = { .secure = env->v7m.secure };
++
++        address_space_read(cs->as, vecbase, attrs,
++                           (uint8_t *)&initial_msp, 4);
++        address_space_read(cs->as, vecbase + 4, attrs,
++                           (uint8_t *)&initial_pc, 4);
+     }
+ 
+     qemu_log_mask(CPU_LOG_INT,

@@ -1,0 +1,176 @@
+diff --git a/qemu-components/common/include/dmi-manager.h b/qemu-components/common/include/dmi-manager.h
+index bc999d6..7f0d378 100644
+--- a/qemu-components/common/include/dmi-manager.h
++++ b/qemu-components/common/include/dmi-manager.h
+@@ -168,6 +168,7 @@ public:
+              * when "overlap-adding" the RAM regions to the DMI-manager root container. */
+             uint64_t offset = DmiRegion::key_from_tlm_dmi(info);
+             m_alias.init_alias(m_container, "dmi-alias", root, offset, (m_end - m_start) + 1);
++            m_alias.set_readonly(!info.is_write_allowed());
+         }
+ 
+         /* helpful for debugging */
+diff --git a/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h b/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
+index 2f3fe7d..a5eaaf6 100644
+--- a/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
++++ b/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
+@@ -351,6 +351,13 @@ public:
+     struct MemTxAttrs {
+         bool secure = false;
+         bool debug = false;
++        bool unspecified = true;
++        bool user = false;
++        bool memory = false;
++        unsigned int space = 0;
++        unsigned int requester_id = 0;
++        unsigned int pid = 0;
++        unsigned int address_type = 0;
+ 
+         MemTxAttrs() = default;
+         MemTxAttrs(const ::MemTxAttrs& qemu_attrs);
+@@ -415,6 +422,7 @@ public:
+     void set_priority(int priority) { m_priority = priority; }
+ 
+     void init(const Object& owner, const char* name, uint64_t size);
++    void set_readonly(bool value);
+     void init_io(Object owner, const char* name, uint64_t size, MemoryRegionOpsPtr ops);
+     void init_ram_ptr(Object owner, const char* name, uint64_t size, void* ptr, int fd = -1);
+     void init_alias(Object owner, const char* name, const MemoryRegion& root, uint64_t offset, uint64_t size);
+diff --git a/qemu-components/common/include/ports/initiator.h b/qemu-components/common/include/ports/initiator.h
+index d1bbda8..1b7d278 100644
+--- a/qemu-components/common/include/ports/initiator.h
++++ b/qemu-components/common/include/ports/initiator.h
+@@ -27,6 +27,7 @@
+ #include <tlm-extensions/exclusive-access.h>
+ #include <tlm-extensions/shmem_extension.h>
+ #include <tlm-extensions/underlying-dmi.h>
++#include <tlm-extensions/mem-tx-attrs.h>
+ #include <tlm_sockets_buswidth.h>
+ 
+ class QemuInitiatorIface
+@@ -119,7 +120,8 @@ protected:
+         return table.end();
+     }
+ 
+-    void init_payload(TlmPayload& trans, tlm::tlm_command command, uint64_t addr, uint64_t* val, unsigned int size)
++    void init_payload(TlmPayload& trans, tlm::tlm_command command, uint64_t addr, uint64_t* val, unsigned int size,
++                      QemuMemTxAttrsExtension* attrs = nullptr)
+     {
+         trans.set_command(command);
+         trans.set_address(addr);
+@@ -130,6 +132,7 @@ protected:
+         trans.set_dmi_allowed(false);
+         trans.set_response_status(tlm::TLM_INCOMPLETE_RESPONSE);
+ 
++        if (attrs) trans.set_extension(attrs);
+         m_initiator.initiator_customize_tlm_payload(trans);
+     }
+ 
+@@ -585,7 +588,9 @@ protected:
+         TlmPayload trans;
+         if (m_finished) return qemu::MemoryRegionOps::MemTxError;
+ 
+-        init_payload(trans, command, addr, val, size);
++        QemuMemTxAttrsExtension attrs_ext;
++        attrs_ext.attrs = attrs;
++        init_payload(trans, command, addr, val, size, &attrs_ext);
+ 
+         if (trans.get_extension<ExclusiveAccessTlmExtension>()) {
+             /* in the case of an exclusive access keep the iolock (and assume NO side-effects)
+@@ -618,6 +623,7 @@ protected:
+             reentrancy--;
+         }
+         m_initiator.initiator_tidy_tlm_payload(trans);
++        trans.clear_extension<QemuMemTxAttrsExtension>();
+ 
+         switch (trans.get_response_status()) {
+         case tlm::TLM_OK_RESPONSE:
+diff --git a/qemu-components/common/src/libqemu-cxx/memory.cc b/qemu-components/common/src/libqemu-cxx/memory.cc
+index d441575..8a93231 100644
+--- a/qemu-components/common/src/libqemu-cxx/memory.cc
++++ b/qemu-components/common/src/libqemu-cxx/memory.cc
+@@ -54,8 +54,30 @@ static inline uint32_t LIB_TO_QEMU_MEMTXRESULT_MAPPING(MemoryRegionOps::MemTxRes
+  * ===============
+  */
+ 
++static ::MemTxAttrs to_qemu_attrs(const MemoryRegionOps::MemTxAttrs& attrs)
++{
++    ::MemTxAttrs result = {};
++    result.secure = attrs.secure;
++    result.debug = attrs.debug;
++    result.unspecified = attrs.unspecified;
++    result.user = attrs.user;
++    result.memory = attrs.memory;
++    result.space = attrs.space;
++    result.requester_id = attrs.requester_id;
++    result.pid = attrs.pid;
++    result.address_type = attrs.address_type;
++    return result;
++}
++
++void MemoryRegion::set_readonly(bool value)
++{
++    m_int->exports().memory_region_set_readonly(reinterpret_cast<QemuMemoryRegion*>(m_obj), value);
++}
++
+ MemoryRegionOps::MemTxAttrs::MemTxAttrs(const ::MemTxAttrs& qemu_attrs)
+-    : secure(qemu_attrs.secure), debug(qemu_attrs.debug)
++    : secure(qemu_attrs.secure), debug(qemu_attrs.debug), unspecified(qemu_attrs.unspecified),
++      user(qemu_attrs.user), memory(qemu_attrs.memory), space(qemu_attrs.space),
++      requester_id(qemu_attrs.requester_id), pid(qemu_attrs.pid), address_type(qemu_attrs.address_type)
+ {
+ }
+ 
+@@ -211,7 +233,7 @@ MemoryRegion::MemTxResult MemoryRegion::dispatch_read(uint64_t addr, uint64_t* d
+     ::MemTxResult qemu_res;
+     QemuMemoryRegion* mr = reinterpret_cast<QemuMemoryRegion*>(m_obj);
+ 
+-    qemu_attrs.secure = attrs.secure;
++    qemu_attrs = to_qemu_attrs(attrs);
+ 
+     qemu_res = m_int->exports().memory_region_dispatch_read(mr, addr, data, size, qemu_attrs);
+ 
+@@ -224,7 +246,7 @@ MemoryRegion::MemTxResult MemoryRegion::dispatch_write(uint64_t addr, uint64_t d
+     ::MemTxResult qemu_res;
+     QemuMemoryRegion* mr = reinterpret_cast<QemuMemoryRegion*>(m_obj);
+ 
+-    qemu_attrs.secure = attrs.secure;
++    qemu_attrs = to_qemu_attrs(attrs);
+ 
+     qemu_res = m_int->exports().memory_region_dispatch_write(mr, addr, data, size, qemu_attrs);
+ 
+@@ -288,7 +310,7 @@ AddressSpace::MemTxResult AddressSpace::read(uint64_t addr, void* data, size_t s
+     ::MemTxAttrs qemu_attrs = {};
+     ::MemTxResult qemu_res;
+ 
+-    qemu_attrs.secure = attrs.secure;
++    qemu_attrs = to_qemu_attrs(attrs);
+ 
+     qemu_res = m_int->exports().address_space_read(m_as, addr, qemu_attrs, data, size);
+ 
+@@ -301,7 +323,7 @@ AddressSpace::MemTxResult AddressSpace::write(uint64_t addr, const void* data, s
+     ::MemTxAttrs qemu_attrs = {};
+     ::MemTxResult qemu_res;
+ 
+-    qemu_attrs.secure = attrs.secure;
++    qemu_attrs = to_qemu_attrs(attrs);
+ 
+     qemu_res = m_int->exports().address_space_write(m_as, addr, qemu_attrs, data, size);
+ 
+diff --git a/qemu-components/common/include/tlm-extensions/mem-tx-attrs.h b/qemu-components/common/include/tlm-extensions/mem-tx-attrs.h
+new file mode 100644
+--- /dev/null
++++ b/qemu-components/common/include/tlm-extensions/mem-tx-attrs.h
+@@ -0,0 +1,12 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#pragma once
++#include <tlm>
++#include <libqemu-cxx/libqemu-cxx.h>
++
++struct QemuMemTxAttrsExtension : tlm::tlm_extension<QemuMemTxAttrsExtension> {
++    qemu::MemoryRegionOps::MemTxAttrs attrs;
++    tlm::tlm_extension_base* clone() const override { return new QemuMemTxAttrsExtension(*this); }
++    void copy_from(const tlm::tlm_extension_base& other) override {
++        attrs = static_cast<const QemuMemTxAttrsExtension&>(other).attrs;
++    }
++};

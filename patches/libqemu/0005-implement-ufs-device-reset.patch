@@ -1,0 +1,73 @@
+--- a/hw/ufs/ufs.c
++++ b/hw/ufs/ufs.c
+@@ -432,6 +432,10 @@
+      */
+     switch (val) {
+     case UFS_UIC_CMD_DME_LINK_STARTUP:
++        if (u->device_reset_asserted) {
++            u->reg.ucmdarg2 = UFS_UIC_CMD_RESULT_FAILURE;
++            break;
++        }
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, DP, 1);
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTRLRDY, 1);
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTMRLRDY, 1);
+@@ -442,6 +446,7 @@
+         uint32_t value;
+         attr_id = (u->reg.ucmdarg1 >> 16) & 0xFFFF;
+         u->reg.ucmdarg2 = (u->reg.ucmdarg1 & 0xffff) ||
++            (val == UFS_UIC_CMD_DME_PEER_GET && u->device_reset_asserted) ||
+             !ufs_uic_dme_get_value(u, attr_id, &value) ?
+             UFS_UIC_CMD_RESULT_FAILURE : UFS_UIC_CMD_RESULT_SUCCESS;
+         if (u->reg.ucmdarg2 == UFS_UIC_CMD_RESULT_SUCCESS) {
+@@ -2593,12 +2598,41 @@
+                           u->reg_size);
+ }
+ 
++static void ufs_device_reset_n(void *opaque, int line, int level)
++{
++    UfsHc *u = opaque;
++    bool asserted = !level;
++
++    if (asserted == u->device_reset_asserted) {
++        return;
++    }
++    if (asserted) {
++        /* The SystemC consumer rejects a busy reset before driving this input. */
++        g_assert(!u->params.mcq && !u->reg.utrldbr && !u->reg.utmrldbr);
++        for (unsigned i = 0; i < u->params.nutrs; i++) {
++            g_assert(u->req_list[i].state == UFS_REQUEST_IDLE);
++        }
++        u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, DP, 0);
++        u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTRLRDY, 0);
++        u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTMRLRDY, 0);
++        u->flags.device_init = 0;
++        for (unsigned i = 0; i < UFS_MAX_LUS; i++) {
++            if (u->lus[i] && u->lus[i]->scsi_dev) {
++                device_cold_reset(DEVICE(u->lus[i]->scsi_dev));
++            }
++        }
++    }
++    /* Release does not perform link startup or restore device presence. */
++    u->device_reset_asserted = asserted;
++}
++
+ static void ufs_init_sysbus(DeviceState *dev)
+ {
+     UfsHc *u = UFS_SYSBUS(dev);
+     mem_reg_init_io(u, "ufs-sysbus");
+     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &u->iomem);
+     sysbus_init_irq(SYS_BUS_DEVICE(dev), &u->irq);
++    qdev_init_gpio_in_named(dev, ufs_device_reset_n, "device-reset-n", 1);
+ 
+     u->mem_as = &address_space_memory;
+     u->mem_mr = get_system_memory();
+--- a/hw/ufs/ufs.h
++++ b/hw/ufs/ufs.h
+@@ -161,6 +161,7 @@
+     UfsMcqOpReg mcq_op_reg[UFS_MAX_MCQ_QNUM];
+     UfsParams params;
+     uint32_t pa_save_config_time;
++    bool device_reset_asserted;
+     uint32_t reg_size;
+     UfsRequest *req_list;
+ 

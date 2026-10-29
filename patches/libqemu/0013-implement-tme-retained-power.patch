@@ -1,0 +1,144 @@
+From: qcom-vp maintainers
+Subject: [PATCH] riscv: model opt-in retained-power WFI and interrupt resume
+
+The virtual controller arms one retained sleep after the OEM bank-seven
+request sequence. Actual WFI consumes the arm. Eligible interrupt state
+resumes at the published vector without resetting PMP or acknowledging IRQs.
+The original restore code controls subsequent interrupt delivery.
+
+--- a/target/riscv/cpu_cfg.h
++++ b/target/riscv/cpu_cfg.h
+@@ -23,6 +23,7 @@
+ 
+ struct RISCVCPUConfig {
+     bool qcom_clic;
++    bool qcom_retained_power;
+ #define BOOL_FIELD(x) bool x;
+ #define TYPED_FIELD(type, x, default) type x;
+ #include "cpu_cfg_fields.h.inc"
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -310,6 +310,11 @@
+ 
+     /* External CLIC levels survive CPU reset, like external GPIO inputs. */
+     bool qcom_clic_irq[65];
++    /* Explicit virtual retained-power state, not architectural reset. */
++    uint32_t qcom_power_vector;
++    uint32_t qcom_power_resume;
++    bool qcom_power_armed;
++    bool qcom_power_sleeping;
+ 
+     /* CSRs for Xqci */
+     target_ulong qc_mcause;
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -813,6 +813,8 @@
+     env->miclaim = MIP_SGEIP;
+     env->pc = env->resetvec;
+     env->ceased = false;
++    env->qcom_power_armed = false;
++    env->qcom_power_sleeping = false;
+     env->bins = 0;
+     env->two_stage_lookup = false;
+ 
+@@ -2685,6 +2687,8 @@
+ };
+ 
+ static PropertyInfo prop_uint64_resetvec; /* qdev_prop_uint64 + realized_set_allowed */
++static PropertyInfo prop_qcom_power_vector;
++static PropertyInfo prop_qcom_power_armed;
+ 
+ static const Property riscv_cpu_properties[] = {
+     DEFINE_PROP_BOOL("debug", RISCVCPU, cfg.debug, true),
+@@ -2692,6 +2696,11 @@
+ #ifndef CONFIG_USER_ONLY
+     DEFINE_PROP_BOOL("x-sifive-cease", RISCVCPU, cfg.sifive_cease, false),
+     DEFINE_PROP_BOOL("x-qcom-clic", RISCVCPU, cfg.qcom_clic, false),
++    DEFINE_PROP_BOOL("x-qcom-retained-power", RISCVCPU, cfg.qcom_retained_power, false),
++    DEFINE_PROP_UNSIGNED("x-qcom-power-vector", RISCVCPU, env.qcom_power_vector,
++                         0, prop_qcom_power_vector, uint32_t),
++    DEFINE_PROP("x-qcom-power-armed", RISCVCPU, env.qcom_power_armed,
++                prop_qcom_power_armed, bool, .set_default = true, .defval.u = false),
+ #endif
+ 
+     {.name = "pmu-mask", .info = &prop_pmu_mask},
+@@ -2815,6 +2824,10 @@
+     /* Clone uint64 property with set allowed after realized */
+     prop_uint64_resetvec = qdev_prop_uint64;
+     prop_uint64_resetvec.realized_set_allowed = true;
++    prop_qcom_power_vector = qdev_prop_uint32;
++    prop_qcom_power_vector.realized_set_allowed = true;
++    prop_qcom_power_armed = qdev_prop_bool;
++    prop_qcom_power_armed.realized_set_allowed = true;
+ 
+     device_class_set_props(dc, riscv_cpu_properties);
+ }
+--- a/target/riscv/op_helper.c
++++ b/target/riscv/op_helper.c
+@@ -567,6 +567,12 @@
+                (prv_u || (prv_s && get_field(env->hstatus, HSTATUS_VTW)))) {
+         riscv_raise_exception(env, RISCV_EXCP_VIRT_INSTRUCTION_FAULT, GETPC());
+     } else {
++        if (riscv_cpu_cfg(env)->qcom_retained_power && env->qcom_power_armed) {
++            /* Consume exactly one arm at actual WFI, not at an MMIO write. */
++            env->qcom_power_armed = false;
++            env->qcom_power_resume = env->qcom_power_vector;
++            env->qcom_power_sleeping = true;
++        }
+         cs->halted = 1;
+         cs->exception_index = EXCP_HLT;
+         cpu_loop_exit(cs);
+--- a/target/riscv/cpu_helper.c
++++ b/target/riscv/cpu_helper.c
+@@ -614,6 +614,15 @@
+     if (interrupt_request & mask) {
+         RISCVCPU *cpu = RISCV_CPU(cs);
+         CPURISCVState *env = &cpu->env;
++        if (cpu->cfg.qcom_retained_power && env->qcom_power_sleeping &&
++            riscv_cpu_has_work(cs)) {
++            /* Real eligible pending state wakes the retained CPU. Preserve the
++             * source and all protection state. The guest restores mstatus. */
++            env->qcom_power_sleeping = false;
++            env->mstatus &= ~MSTATUS_MIE;
++            env->pc = env->qcom_power_resume;
++            return true;
++        }
+         int interruptno = riscv_cpu_local_irq_pending(env);
+         if (interruptno >= 0) {
+             cs->exception_index = RISCV_EXCP_INT_FLAG | interruptno;
+--- a/target/riscv/machine.c
++++ b/target/riscv/machine.c
+@@ -464,6 +464,25 @@
+     .needed = qcom_clic_needed,
+     .fields = (const VMStateField[]) {
+         VMSTATE_BOOL_ARRAY(env.qcom_clic_irq, RISCVCPU, 65),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static bool qcom_retained_power_needed(void *opaque)
++{
++    return RISCV_CPU(opaque)->cfg.qcom_retained_power;
++}
++
++static const VMStateDescription vmstate_qcom_retained_power = {
++    .name = "cpu/qcom-retained-power",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = qcom_retained_power_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(env.qcom_power_vector, RISCVCPU),
++        VMSTATE_UINT32(env.qcom_power_resume, RISCVCPU),
++        VMSTATE_BOOL(env.qcom_power_armed, RISCVCPU),
++        VMSTATE_BOOL(env.qcom_power_sleeping, RISCVCPU),
+         VMSTATE_END_OF_LIST()
+     }
+ };
+@@ -546,6 +565,7 @@
+         &vmstate_sstc,
+         &vmstate_mseccfg,
+         &vmstate_qcom_clic,
++        &vmstate_qcom_retained_power,
+         NULL
+     }
+ };

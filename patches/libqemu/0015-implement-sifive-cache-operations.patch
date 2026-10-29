@@ -1,0 +1,103 @@
+diff --git a/target/riscv/cpu_cfg_fields.h.inc b/target/riscv/cpu_cfg_fields.h.inc
+--- a/target/riscv/cpu_cfg_fields.h.inc
++++ b/target/riscv/cpu_cfg_fields.h.inc
+@@ -8,2 +8,3 @@
+ BOOL_FIELD(sifive_cease)
++BOOL_FIELD(sifive_cache_operations)
+ BOOL_FIELD(ext_zba)
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -2696,3 +2696,5 @@
+ #ifndef CONFIG_USER_ONLY
+     DEFINE_PROP_BOOL("x-sifive-cease", RISCVCPU, cfg.sifive_cease, false),
++    DEFINE_PROP_BOOL("x-sifive-cache-operations", RISCVCPU,
++                     cfg.sifive_cache_operations, false),
+     DEFINE_PROP_BOOL("x-qcom-clic", RISCVCPU, cfg.qcom_clic, false),
+diff --git a/target/riscv/insn32.decode b/target/riscv/insn32.decode
+--- a/target/riscv/insn32.decode
++++ b/target/riscv/insn32.decode
+@@ -122,2 +122,4 @@
+ cease       0011000    00101 00000 000 00000 1110011
++cflush_d_l1 1111110    00000 ..... 000 00000 1110011 %rs1
++cdiscard_d_l1 1111110  00010 ..... 000 00000 1110011 %rs1
+ sfence_vma  0001001    ..... ..... 000 00000 1110011 @sfence_vma
+diff --git a/target/riscv/helper.h b/target/riscv/helper.h
+--- a/target/riscv/helper.h
++++ b/target/riscv/helper.h
+@@ -140,2 +140,3 @@
+ DEF_HELPER_1(cease, noreturn, env)
++DEF_HELPER_3(sifive_cache_operation, void, env, tl, i32)
+ DEF_HELPER_1(wrs_nto, void, env)
+diff --git a/target/riscv/op_helper.c b/target/riscv/op_helper.c
+--- a/target/riscv/op_helper.c
++++ b/target/riscv/op_helper.c
+@@ -544,2 +544,31 @@
++void helper_sifive_cache_operation(CPURISCVState *env, target_ulong address,
++                                   uint32_t all)
++{
++    uintptr_t ra = GETPC();
++
++    if (env->priv != PRV_M) {
++        riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, ra);
++    }
++
++    /* rs1=x0 selects all resident lines, not the line at address zero. */
++    if (all) {
++        return;
++    }
++
++    /*
++     * SiFive checks write permission at the operand address, even when PMP
++     * protects only part of a line. Do not align down or probe the whole
++     * line: either would reject a documented writable-subregion operation.
++     * The normal store MMU index preserves MPRV and locked PMP checks.
++     */
++    probe_write(env, address, 1, riscv_env_mmu_index(env, false), ra);
++
++    /*
++     * QEMU has no dirty data-cache lines. CFLUSH has nothing to write back,
++     * and CDISCARD has no private dirty data to lose. Preserve coherent RAM
++     * and do not issue stores or MMIO transactions for either operation.
++     */
++}
++
+ void helper_cease(CPURISCVState *env)
+ {
+diff --git a/target/riscv/insn_trans/trans_privileged.c.inc b/target/riscv/insn_trans/trans_privileged.c.inc
+--- a/target/riscv/insn_trans/trans_privileged.c.inc
++++ b/target/riscv/insn_trans/trans_privileged.c.inc
+@@ -142,2 +142,33 @@
++static bool gen_sifive_cache_operation(DisasContext *ctx, int rs1)
++{
++#ifndef CONFIG_USER_ONLY
++    TCGv address;
++
++    if (!ctx->cfg_ptr->sifive_cache_operations) {
++        return false;
++    }
++
++    address = get_address(ctx, rs1, 0);
++    decode_save_opc(ctx, 0);
++    gen_helper_sifive_cache_operation(tcg_env, address,
++                                      tcg_constant_i32(rs1 == 0));
++    return true;
++#else
++    return false;
++#endif
++}
++
++static bool trans_cflush_d_l1(DisasContext *ctx, arg_cflush_d_l1 *a)
++{
++    /* Writeback and invalidation use the coherent-memory helper. */
++    return gen_sifive_cache_operation(ctx, a->rs1);
++}
++
++static bool trans_cdiscard_d_l1(DisasContext *ctx, arg_cdiscard_d_l1 *a)
++{
++    /* Invalidation alone has the same permission checks, without stores. */
++    return gen_sifive_cache_operation(ctx, a->rs1);
++}
++
+ static bool trans_cease(DisasContext *ctx, arg_cease *a)
+ {

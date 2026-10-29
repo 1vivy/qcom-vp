@@ -1,0 +1,67 @@
+From: qcom-vp maintainers
+Subject: [PATCH] arm: add the ETE programmer words QHEE uses
+
+QHEE programs the self-hosted trace unit before it starts the guest. It writes
+TRCPRGCTLR (S2_1_C0_C1_0), reads TRCSTATR (S2_1_C0_C3_0), reads TRCIDR2, TRCIDR4
+and TRCIDR5, and writes TRBLIMITR_EL1 (S3_0_C9_C11_0). QEMU has none of them.
+
+Add a minimal programmer model to the opt-in identification profile.
+TRCPRGCTLR and TRBLIMITR_EL1 retain their words, TRCSTATR reports the idle bit
+from program control plus a stable pipeline, and the identification words keep
+the values the firmware compares against. No trace unit, buffer, or output
+exists, and ID_AA64DFR0.TraceBuffer stays zero.
+
+Source: Arm DDI 0601 (2024-03), TRCPRGCTLR, TRCSTATR, TRCIDR2/4/5, TRBLIMITR.
+https://developer.arm.com/documentation/ddi0601/2024-03/
+
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -585,6 +585,9 @@
+         uint64_t mpamhcr_el2;
+         /* Opt-in trace filter control, no trace hardware behind it. */
+         uint64_t trfcr_el2;
++        /* Opt-in trace programmer model: program control and buffer limit. */
++        uint64_t trcprgctlr;
++        uint64_t trblimitr_el1;
+     } cp15;
+ 
+     struct {
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -5447,6 +5447,13 @@
+  * the S2_ space, where opc1 selects the minimum exception level, so the access
+  * right stays inside the PL1_RW mask that define_one_arm_cp_reg requires.
+  */
++static uint64_t qcom_trcstatr_read(CPUARMState *env, const ARMCPRegInfo *ri)
++{
++    /* The trace unit is idle while program control is clear, and the
++     * pipeline is always stable because no trace unit exists. */
++    return ((env->cp15.trcprgctlr & 1) ? 0 : 1) | 2;
++}
++
+ static const ARMCPRegInfo qcom_ids_reginfo[] = {
+     { .name = "AMCFGR_EL0", .state = ARM_CP_STATE_AA64,
+       .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 1,
+@@ -5463,6 +5470,22 @@
+     { .name = "TRCIDR5", .state = ARM_CP_STATE_AA64,
+       .opc0 = 2, .opc1 = 1, .crn = 0, .crm = 13, .opc2 = 7,
+       .access = PL1_R, .type = ARM_CP_CONST, .resetvalue = 0x28000800 },
++    /* Program control retains the enable bit, and TRCSTATR reports the idle
++     * state that follows it. No trace unit, buffer, or output exists. */
++    { .name = "TRCPRGCTLR", .state = ARM_CP_STATE_AA64,
++      .opc0 = 2, .opc1 = 1, .crn = 0, .crm = 1, .opc2 = 0,
++      .access = PL1_RW, .resetvalue = 0,
++      .fieldoffset = offsetof(CPUARMState, cp15.trcprgctlr) },
++    { .name = "TRCSTATR", .state = ARM_CP_STATE_AA64,
++      .opc0 = 2, .opc1 = 1, .crn = 0, .crm = 3, .opc2 = 0,
++      .access = PL1_R, .type = ARM_CP_NO_RAW,
++      .readfn = qcom_trcstatr_read },
++    /* Trace buffer limit. TraceBuffer stays zero in ID_AA64DFR0, so the word
++     * is retained and no buffer is programmed or filled. */
++    { .name = "TRBLIMITR_EL1", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 0, .crn = 9, .crm = 11, .opc2 = 0,
++      .access = PL1_RW, .resetvalue = 0,
++      .fieldoffset = offsetof(CPUARMState, cp15.trblimitr_el1) },
+     /* Trace filter control: the guest writes it and reads nothing back that
+      * changes behaviour. The value is retained with no trace hardware. */
+     { .name = "TRFCR_EL2", .state = ARM_CP_STATE_AA64,

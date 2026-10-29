@@ -1,0 +1,11 @@
+diff --git a/qemu-components/common/include/tlm-extensions/qemu-cpu-hint.h b/qemu-components/common/include/tlm-extensions/qemu-cpu-hint.h
+--- a/qemu-components/common/include/tlm-extensions/qemu-cpu-hint.h
++++ b/qemu-components/common/include/tlm-extensions/qemu-cpu-hint.h
+@@ -33,6 +33,6 @@
+ 
+     void set_cpu(qemu::Cpu cpu) { m_cpu = cpu; }
+-    qemu::Cpu get_cpu() const { return m_cpu; }
++    const qemu::Cpu& get_cpu() const { return m_cpu; }
+ };
+ 
+ #endif

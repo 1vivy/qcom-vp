@@ -1,0 +1,210 @@
+diff --git a/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h b/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
+--- a/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
++++ b/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
+@@ -367,12 +367,18 @@
+ 
+     typedef std::function<MemTxResult(uint64_t, uint64_t, unsigned int, MemTxAttrs)> WriteCallback;
+ 
++    typedef std::function<MemTxResult(uint64_t, void*, uint64_t, MemTxAttrs)> BulkReadCallback;
++
++    typedef std::function<MemTxResult(uint64_t, const void*, uint64_t, MemTxAttrs)> BulkWriteCallback;
++
+ private:
+     QemuMemoryRegionOps* m_ops;
+     std::shared_ptr<LibQemuInternals> m_int;
+ 
+     ReadCallback m_read_cb;
+     WriteCallback m_write_cb;
++    BulkReadCallback m_bulk_read_cb;
++    BulkWriteCallback m_bulk_write_cb;
+ 
+ public:
+     MemoryRegionOps(QemuMemoryRegionOps* ops, std::shared_ptr<LibQemuInternals> internals);
+@@ -380,11 +386,15 @@
+ 
+     void set_read_callback(ReadCallback cb);
+     void set_write_callback(WriteCallback cb);
++    void set_bulk_read_callback(BulkReadCallback cb);
++    void set_bulk_write_callback(BulkWriteCallback cb);
+ 
+     void set_max_access_size(unsigned size);
+ 
+     ReadCallback get_read_callback() { return m_read_cb; }
+     WriteCallback get_write_callback() { return m_write_cb; }
++    BulkReadCallback get_bulk_read_callback() { return m_bulk_read_cb; }
++    BulkWriteCallback get_bulk_write_callback() { return m_bulk_write_cb; }
+ 
+     QemuMemoryRegionOps* get_qemu_mr_ops() { return m_ops; }
+ };
+diff --git a/qemu-components/common/src/libqemu-cxx/memory.cc b/qemu-components/common/src/libqemu-cxx/memory.cc
+--- a/qemu-components/common/src/libqemu-cxx/memory.cc
++++ b/qemu-components/common/src/libqemu-cxx/memory.cc
+@@ -122,6 +122,48 @@
+     m_int->exports().mr_ops_set_write_cb(m_ops, generic_write_cb);
+ }
+ 
++static ::MemTxResult generic_bulk_read_cb(void* opaque, hwaddr addr, void* buf, hwaddr len,
++                                          MemTxAttrs qemu_attrs)
++{
++    MemoryRegionOps* ops = reinterpret_cast<MemoryRegionOps*>(opaque);
++    MemoryRegionOps::MemTxAttrs attrs(qemu_attrs);
++    MemoryRegionOps::BulkReadCallback cb = ops->get_bulk_read_callback();
++
++    if (!cb || len > std::numeric_limits<unsigned int>::max()) {
++        return MEMTX_ACCESS_ERROR;
++    }
++
++    return LIB_TO_QEMU_MEMTXRESULT_MAPPING(cb(addr, buf, len, attrs));
++}
++
++static ::MemTxResult generic_bulk_write_cb(void* opaque, hwaddr addr, const void* buf, hwaddr len,
++                                           MemTxAttrs qemu_attrs)
++{
++    MemoryRegionOps* ops = reinterpret_cast<MemoryRegionOps*>(opaque);
++    MemoryRegionOps::MemTxAttrs attrs(qemu_attrs);
++    MemoryRegionOps::BulkWriteCallback cb = ops->get_bulk_write_callback();
++
++    if (!cb || len > std::numeric_limits<unsigned int>::max()) {
++        return MEMTX_ACCESS_ERROR;
++    }
++
++    return LIB_TO_QEMU_MEMTXRESULT_MAPPING(cb(addr, buf, len, attrs));
++}
++
++void MemoryRegionOps::set_bulk_read_callback(BulkReadCallback cb)
++{
++    m_bulk_read_cb = cb;
++    m_int->exports().mr_ops_set_bulk_cb(m_ops, m_bulk_read_cb ? generic_bulk_read_cb : nullptr,
++                                        m_bulk_write_cb ? generic_bulk_write_cb : nullptr, this);
++}
++
++void MemoryRegionOps::set_bulk_write_callback(BulkWriteCallback cb)
++{
++    m_bulk_write_cb = cb;
++    m_int->exports().mr_ops_set_bulk_cb(m_ops, m_bulk_read_cb ? generic_bulk_read_cb : nullptr,
++                                        m_bulk_write_cb ? generic_bulk_write_cb : nullptr, this);
++}
++
+ void MemoryRegionOps::set_max_access_size(unsigned size) { m_int->exports().mr_ops_set_max_access_size(m_ops, size); }
+ 
+ /*
+diff --git a/qemu-components/common/include/ports/initiator.h b/qemu-components/common/include/ports/initiator.h
+--- a/qemu-components/common/include/ports/initiator.h
++++ b/qemu-components/common/include/ports/initiator.h
+@@ -83,6 +83,7 @@
+     int reentrancy = 0;
+ 
+     std::atomic<bool> m_finished = false;
++    bool m_bulk_access_enabled = false;
+ 
+     std::shared_ptr<qemu::AddressSpace> m_as;
+     std::shared_ptr<qemu::MemoryListener> m_listener;
+@@ -120,7 +121,7 @@
+         return table.end();
+     }
+ 
+-    void init_payload(TlmPayload& trans, tlm::tlm_command command, uint64_t addr, uint64_t* val, unsigned int size,
++    void init_payload(TlmPayload& trans, tlm::tlm_command command, uint64_t addr, void* val, unsigned int size,
+                       QemuMemTxAttrsExtension* attrs = nullptr)
+     {
+         trans.set_command(command);
+@@ -136,6 +137,20 @@
+         m_initiator.initiator_customize_tlm_payload(trans);
+     }
+ 
++    void configure_ops(qemu::MemoryRegionOpsPtr& ops)
++    {
++        using namespace std::placeholders;
++
++        ops->set_read_callback(std::bind(&QemuInitiatorSocket::qemu_io_read, this, _1, _2, _3, _4));
++        ops->set_write_callback(std::bind(&QemuInitiatorSocket::qemu_io_write, this, _1, _2, _3, _4));
++        ops->set_max_access_size(8);
++        if (m_bulk_access_enabled) {
++            ops->set_bulk_read_callback(std::bind(&QemuInitiatorSocket::qemu_io_bulk_read, this, _1, _2, _3, _4));
++            ops->set_bulk_write_callback(
++                std::bind(&QemuInitiatorSocket::qemu_io_bulk_write, this, _1, _2, _3, _4));
++        }
++    }
++
+     void add_dmi_mr_alias(DmiRegionAlias::Ptr alias)
+     {
+         SCP_INFO(()) << "Adding " << *alias;
+@@ -438,12 +453,9 @@
+                 SCP_INFO(())
+                 ("Adding IOMMU for VA 0x{:x} [0x{:x} - 0x{:x}]", trans.get_address(), start, start + size - 1);
+ 
+-                using namespace std::placeholders;
+                 qemu::MemoryRegionOpsPtr ops;
+                 ops = m_inst.get().memory_region_ops_new();
+-                ops->set_read_callback(std::bind(&QemuInitiatorSocket::qemu_io_read, this, _1, _2, _3, _4));
+-                ops->set_write_callback(std::bind(&QemuInitiatorSocket::qemu_io_write, this, _1, _2, _3, _4));
+-                ops->set_max_access_size(8);
++                configure_ops(ops);
+ 
+                 auto iommumr = std::make_shared<qemu::IOMMUMemoryRegion>(
+                     m_inst.get().template object_new_unparented<qemu::IOMMUMemoryRegion>());
+@@ -582,7 +594,7 @@
+         (*this)->b_transport(trans, now);
+     }
+ 
+-    MemTxResult qemu_io_access(tlm::tlm_command command, uint64_t addr, uint64_t* val, unsigned int size,
++    MemTxResult qemu_io_access(tlm::tlm_command command, uint64_t addr, void* val, unsigned int size,
+                                MemTxAttrs attrs)
+     {
+         TlmPayload trans;
+@@ -648,6 +660,25 @@
+         return qemu_io_access(tlm::TLM_WRITE_COMMAND, addr, &val, size, attrs);
+     }
+ 
++    void enable_bulk_access() { m_bulk_access_enabled = true; }
++
++    MemTxResult qemu_io_bulk_read(uint64_t addr, void* buf, uint64_t len, MemTxAttrs attrs)
++    {
++        if (len > std::numeric_limits<unsigned int>::max()) {
++            return qemu::MemoryRegionOps::MemTxError;
++        }
++        return qemu_io_access(tlm::TLM_READ_COMMAND, addr, buf, static_cast<unsigned int>(len), attrs);
++    }
++
++    MemTxResult qemu_io_bulk_write(uint64_t addr, const void* buf, uint64_t len, MemTxAttrs attrs)
++    {
++        if (len > std::numeric_limits<unsigned int>::max()) {
++            return qemu::MemoryRegionOps::MemTxError;
++        }
++        return qemu_io_access(tlm::TLM_WRITE_COMMAND, addr, const_cast<void*>(buf),
++                              static_cast<unsigned int>(len), attrs);
++    }
++
+     bool is_on_sysc() const { return std::this_thread::get_id() == m_thread_id; }
+ 
+     QemuInitiatorSocket(const char* name, QemuInitiatorIface& initiator, QemuInstance& inst)
+@@ -663,17 +694,13 @@
+ 
+     void init(qemu::Device& dev, const char* prop)
+     {
+-        using namespace std::placeholders;
+-
+         qemu::LibQemu& inst = m_inst.get();
+         qemu::MemoryRegionOpsPtr ops;
+ 
+         m_r = new m_mem_obj(inst); // oot = inst.object_new<qemu::MemoryRegion>();
+         ops = inst.memory_region_ops_new();
+ 
+-        ops->set_read_callback(std::bind(&QemuInitiatorSocket::qemu_io_read, this, _1, _2, _3, _4));
+-        ops->set_write_callback(std::bind(&QemuInitiatorSocket::qemu_io_write, this, _1, _2, _3, _4));
+-        ops->set_max_access_size(8);
++        configure_ops(ops);
+ 
+         m_r->m_root->init_io(dev, TlmInitiatorSocket::name(), std::numeric_limits<uint64_t>::max(), ops);
+         dev.set_prop_link(prop, *m_r->m_root);
+@@ -744,9 +771,7 @@
+         qemu::MemoryRegionOpsPtr ops;
+         ops = inst.memory_region_ops_new();
+ 
+-        ops->set_read_callback(std::bind(&QemuInitiatorSocket::qemu_io_read, this, _1, _2, _3, _4));
+-        ops->set_write_callback(std::bind(&QemuInitiatorSocket::qemu_io_write, this, _1, _2, _3, _4));
+-        ops->set_max_access_size(8);
++        configure_ops(ops);
+ 
+         auto system_memory = inst.get_system_memory();
+         system_memory->init_io(dev, TlmInitiatorSocket::name(), std::numeric_limits<uint64_t>::max() - 1, ops);

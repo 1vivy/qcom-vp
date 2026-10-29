@@ -1,0 +1,146 @@
+From: qcom-vp maintainers
+Subject: [PATCH] arm: add opt-in Qualcomm identification words on TCG max
+
+The selected SM8850 hypervisor validates the APSS core identification before
+it enables any interrupt. It reads AMCFGR_EL0 at image offset 0x48314,
+AMCGCR_EL0 at 0x48334, ID_AA64MMFR2_EL1 at 0x48354, ID_AA64DFR0_EL1 at
+0x48368, TRCIDR2 at 0x48390, TRCIDR4 at 0x48398, TRCIDR5 at 0x4839c,
+ID_AA64MMFR1_EL1 at 0x48790, and ID_AA64ISAR2_EL1 at 0x487ac.
+QEMU defines no activity-monitor identification register and no trace
+identification register, so the first read raises an Undefined Instruction
+exception and the hypervisor panics in its identity check.
+
+Add a bounded identification profile under an opt-in CPU property. The profile
+reports the words that the firmware compares against and implements no
+activity counter, no trace unit, and no execution path change. The trace words
+are read-only retained values. TRFCR_EL2 is a retained store, because the
+firmware writes it after the identification check and this model produces no
+trace output.
+
+Source: Arm DDI 0601 (2024-03), AMCFGR_EL0, AMCGCR_EL0, ID_AA64PFR0_EL1,
+ID_AA64PFR1_EL1, ID_AA64MMFR2_EL1, ID_AA64DFR0_EL1, ID_AA64ISAR2_EL1, and the
+ETM/ETE trace identification registers TRCIDR2, TRCIDR4, and TRCIDR5.
+https://developer.arm.com/documentation/ddi0601/2024-03/
+
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -581,6 +581,8 @@
+         uint64_t mpam3_el3;
+         uint64_t mpam2_el2;
+         uint64_t mpam1_el1;
++        /* Opt-in trace filter control, no trace hardware behind it. */
++        uint64_t trfcr_el2;
+     } cp15;
+ 
+     struct {
+@@ -1011,6 +1013,8 @@
+     bool has_el3;
+     /* TCG max CPU single-partition MPAM profile, disabled by default. */
+     bool qcom_mpam;
++    /* TCG max CPU Qualcomm identification profile, disabled by default. */
++    bool qcom_ids;
+     /* CPU has PMU (Performance Monitor Unit) */
+     bool has_pmu;
+     /* CPU has VFP */
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -2444,8 +2444,29 @@
+         /* Memory mapped trace */
+         FIELD_DP32_IDREG(isar, ID_DFR0, MMAPTRC, 0);
+         /* FEAT_AMU (Activity Monitors Extension) */
+-        FIELD_DP64_IDREG(isar, ID_AA64PFR0, AMU, 0);
++        FIELD_DP64_IDREG(isar, ID_AA64PFR0, AMU, cpu->qcom_ids ? 1 : 0);
+         FIELD_DP32_IDREG(isar, ID_PFR0, AMU, 0);
++        if (cpu->qcom_ids) {
++            /*
++             * The selected hypervisor compares these identification fields
++             * with fixed values before it enables any interrupt: self-hosted
++             * trace, E0PD, armv8.6 debug, five breakpoints, three watchpoints,
++             * four MTPMU comparators, and the MOPS field. TCG implements none
++             * of those units, so this profile reports identification only.
++             */
++            uint64_t dfr0 = GET_IDREG(isar, ID_AA64DFR0);
++            uint64_t isar2 = GET_IDREG(isar, ID_AA64ISAR2);
++
++            dfr0 &= ~((0xfULL << 0) | (0xfULL << 12) | (0xfULL << 20) |
++                      (0xfULL << 44));
++            dfr0 |= (6ULL << 0) | (1ULL << 4) | (5ULL << 12) | (3ULL << 20) |
++                    (1ULL << 44);
++            SET_IDREG(isar, ID_AA64DFR0, dfr0);
++            isar2 = (isar2 & ~(0xfULL << 28)) | (1ULL << 28);
++            SET_IDREG(isar, ID_AA64ISAR2, isar2);
++            SET_IDREG(isar, ID_AA64MMFR2,
++                      GET_IDREG(isar, ID_AA64MMFR2) | (1ULL << 60));
++        }
+         /* The opt-in profile implements MPAM v1.0 with zero-width IDs. */
+         FIELD_DP64_IDREG(isar, ID_AA64PFR0, MPAM, cpu->qcom_mpam ? 1 : 0);
+         FIELD_DP64_IDREG(isar, ID_AA64PFR1, MPAM_FRAC, 0);
+--- a/target/arm/tcg/cpu64.c
++++ b/target/arm/tcg/cpu64.c
+@@ -1170,6 +1170,8 @@
+ #ifndef CONFIG_USER_ONLY
+     static const Property qcom_mpam_property =
+         DEFINE_PROP_BOOL("x-qcom-mpam", ARMCPU, qcom_mpam, false);
++    static const Property qcom_ids_property =
++        DEFINE_PROP_BOOL("x-qcom-ids", ARMCPU, qcom_ids, false);
+ #endif
+     uint64_t t;
+     uint32_t u;
+@@ -1452,6 +1454,7 @@
+     qdev_property_add_static(DEVICE(obj), &arm_cpu_lpa2_property);
+ #ifndef CONFIG_USER_ONLY
+     qdev_property_add_static(DEVICE(obj), &qcom_mpam_property);
++    qdev_property_add_static(DEVICE(obj), &qcom_ids_property);
+ #endif
+ }
+ 
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -5430,6 +5430,37 @@
+     .opc0 = 3, .opc1 = 0, .crn = 10, .crm = 5, .opc2 = 3,
+     .access = PL1_RW, .accessfn = access_mpam,
+     .type = ARM_CP_CONST, .resetvalue = 0,
++};
++
++/*
++ * Opt-in identification words for the selected Qualcomm APSS profile. The
++ * firmware compares these words with fixed values. No activity monitor, no
++ * trace unit, and no trace output exists behind them. The trace words sit in
++ * the S2_ space, where opc1 selects the minimum exception level, so the access
++ * right stays inside the PL1_RW mask that define_one_arm_cp_reg requires.
++ */
++static const ARMCPRegInfo qcom_ids_reginfo[] = {
++    { .name = "AMCFGR_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 1,
++      .access = PL0_R, .type = ARM_CP_CONST, .resetvalue = 0xb },
++    { .name = "AMCGCR_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 2,
++      .access = PL0_R, .type = ARM_CP_CONST, .resetvalue = 0x804 },
++    { .name = "TRCIDR2", .state = ARM_CP_STATE_AA64,
++      .opc0 = 2, .opc1 = 1, .crn = 0, .crm = 10, .opc2 = 7,
++      .access = PL1_R, .type = ARM_CP_CONST, .resetvalue = 0x1080 },
++    { .name = "TRCIDR4", .state = ARM_CP_STATE_AA64,
++      .opc0 = 2, .opc1 = 1, .crn = 0, .crm = 12, .opc2 = 7,
++      .access = PL1_R, .type = ARM_CP_CONST, .resetvalue = 0x11140002 },
++    { .name = "TRCIDR5", .state = ARM_CP_STATE_AA64,
++      .opc0 = 2, .opc1 = 1, .crn = 0, .crm = 13, .opc2 = 7,
++      .access = PL1_R, .type = ARM_CP_CONST, .resetvalue = 0x28000800 },
++    /* Trace filter control: the guest writes it and reads nothing back that
++     * changes behaviour. The value is retained with no trace hardware. */
++    { .name = "TRFCR_EL2", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 4, .crn = 1, .crm = 2, .opc2 = 1,
++      .access = PL2_RW, .resetvalue = 0,
++      .fieldoffset = offsetof(CPUARMState, cp15.trfcr_el2) },
+ };
+ 
+ static CPAccessResult access_pauth(CPUARMState *env, const ARMCPRegInfo *ri,
+@@ -7685,6 +7716,9 @@
+             define_one_arm_cp_reg(cpu, &qcom_mpamsm_reginfo);
+         }
+     }
++    if (cpu->qcom_ids) {
++        define_arm_cp_regs(cpu, qcom_ids_reginfo);
++    }
+     if (cpu_isar_feature(aa64_pauth, cpu)) {
+         define_arm_cp_regs(cpu, pauth_reginfo);
+     }

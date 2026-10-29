@@ -1,0 +1,12 @@
+--- a/hw/ufs/ufs.c
++++ b/hw/ufs/ufs.c
+@@ -426,6 +426,9 @@ static bool ufs_uic_dme_get_value(UfsHc *u, uint16_t attr_id, bool peer,
+     case 0x0002: /* Peer TX_HSGEAR capability uses the declared maximum. */
+         *value = 4;
+         return peer;
++    case 0x0022: /* Peer TX_HSRATE_Series follows the negotiated local series. */
++        *value = u->pa_hs_series;
++        return peer;
+     case 0x0023: /* Peer TX_HSGEAR is the connected local RX gear. */
+         *value = u->pa_rx_gear;
+         return peer;

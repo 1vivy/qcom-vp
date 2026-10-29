@@ -1,0 +1,144 @@
+From: qcom-vp maintainers
+Subject: [PATCH] riscv: add opt-in Qualcomm TME nonvectored CLIC delivery
+
+The OEM config contains 49 handlers at IDs 16..64. The candidate runtime
+writes mtvec mode 2 and dispatches the full interrupt ID from mcause.
+Do not fold these sources into mip/mie or truncate IDs to RV32 CSR width.
+The external controller supplies an arbitrated one-hot request through a
+separate named GPIO bank. Ordinary direct/vectored CPUs remain unchanged.
+
+--- a/target/riscv/cpu_cfg.h
++++ b/target/riscv/cpu_cfg.h
+@@ -24,2 +24,3 @@
+ struct RISCVCPUConfig {
++    bool qcom_clic;
+ #define BOOL_FIELD(x) bool x;
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -311,2 +311,5 @@
++    /* External CLIC levels survive CPU reset, like external GPIO inputs. */
++    bool qcom_clic_irq[65];
++
+     /* CSRs for Xqci */
+     target_ulong qc_mcause;
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -750,4 +750,11 @@
+      * mode and delegation registers, but respect individual enables
+      */
++    if (cpu->cfg.qcom_clic && (env->mtvec & 3) == 2) {
++        for (unsigned i = 0; i < ARRAY_SIZE(env->qcom_clic_irq); ++i) {
++            if (env->qcom_clic_irq[i]) {
++                return true;
++            }
++        }
++    }
+     return riscv_cpu_all_pending(env) != 0 ||
+         riscv_cpu_sirq_pending(env) != RISCV_EXCP_NONE ||
+@@ -1125,1 +1132,12 @@
++static void riscv_cpu_set_qcom_clic(void *opaque, int irq, int level)
++{
++    RISCVCPU *cpu = RISCV_CPU(opaque);
++
++    if (!cpu->cfg.qcom_clic) {
++        return;
++    }
++    cpu->env.qcom_clic_irq[irq] = level;
++    riscv_cpu_interrupt(&cpu->env);
++}
++
+ static void riscv_cpu_set_irq(void *opaque, int irq, int level)
+@@ -1220,3 +1238,5 @@
+     qdev_init_gpio_in(DEVICE(obj), riscv_cpu_set_irq,
+                       IRQ_LOCAL_MAX + IRQ_LOCAL_GUEST_MAX);
++    qdev_init_gpio_in_named(DEVICE(obj), riscv_cpu_set_qcom_clic,
++                           "qcom.clic", 65);
+     qdev_init_gpio_in_named(DEVICE(cpu), riscv_cpu_set_nmi,
+@@ -2673,2 +2693,3 @@
+     DEFINE_PROP_BOOL("x-sifive-cease", RISCVCPU, cfg.sifive_cease, false),
++    DEFINE_PROP_BOOL("x-qcom-clic", RISCVCPU, cfg.qcom_clic, false),
+ #endif
+--- a/target/riscv/csr.c
++++ b/target/riscv/csr.c
+@@ -3051,3 +3051,7 @@
+-    if ((val & 3) < 2) {
++    if ((val & 3) < 2 ||
++        ((val & 3) == 2 && riscv_cpu_cfg(env)->qcom_clic)) {
+         env->mtvec = val;
++        if (riscv_cpu_cfg(env)->qcom_clic) {
++            riscv_cpu_interrupt(env);
++        }
+     } else {
+--- a/target/riscv/cpu_helper.c
++++ b/target/riscv/cpu_helper.c
+@@ -553,2 +553,13 @@
++    /* CLIC enables and priority reside in the external controller, not mie.
++     * Mode 2 enters the common handler. mcause retains the selected ID.
++     */
++    if (riscv_cpu_cfg(env)->qcom_clic && (env->mtvec & 3) == 2 && mie) {
++        for (int i = ARRAY_SIZE(env->qcom_clic_irq) - 1; i >= 0; --i) {
++            if (env->qcom_clic_irq[i]) {
++                return i;
++            }
++        }
++    }
++
+     /* Determine all pending interrupts */
+     pending = riscv_cpu_all_pending(env);
+@@ -791,2 +802,9 @@
+-    if (env->mip | vsgein | vstip | irqf) {
++    bool clic_pending = false;
++    if (riscv_cpu_cfg(env)->qcom_clic && (env->mtvec & 3) == 2) {
++        for (unsigned i = 0; i < ARRAY_SIZE(env->qcom_clic_irq); ++i) {
++            clic_pending |= env->qcom_clic_irq[i];
++        }
++    }
++
++    if (env->mip | vsgein | vstip | irqf | clic_pending) {
+         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+@@ -2299,6 +2317,9 @@
+     target_ulong cause = cs->exception_index & RISCV_EXCP_INT_MASK;
++    bool clic = async && cpu->cfg.qcom_clic && (env->mtvec & 3) == 2;
+     uint64_t deleg = async ? env->mideleg : env->medeleg;
+-    bool s_injected = env->mvip & (1ULL << cause) & env->mvien &&
++    bool s_injected = !clic && cause < 64 &&
++        env->mvip & (1ULL << cause) & env->mvien &&
+         !(env->mip & (1ULL << cause));
+-    bool vs_injected = env->hvip & (1ULL << cause) & env->hvien &&
++    bool vs_injected = !clic && cause < 64 &&
++        env->hvip & (1ULL << cause) & env->hvien &&
+         !(env->mip & (1ULL << cause));
+@@ -2418,5 +2439,5 @@
+-    mode = env->priv <= PRV_S && cause < 64 &&
++    mode = !clic && env->priv <= PRV_S && cause < 64 &&
+         (((deleg >> cause) & 1) || s_injected || vs_injected) ? PRV_S : PRV_M;
+ 
+-    vsmode_exc = env->virt_enabled && cause < 64 &&
++    vsmode_exc = !clic && env->virt_enabled && cause < 64 &&
+         (((hdeleg >> cause) & 1) || vs_injected);
+--- a/target/riscv/machine.c
++++ b/target/riscv/machine.c
+@@ -453,1 +453,19 @@
++static bool qcom_clic_needed(void *opaque)
++{
++    RISCVCPU *cpu = opaque;
++
++    return cpu->cfg.qcom_clic;
++}
++
++static const VMStateDescription vmstate_qcom_clic = {
++    .name = "cpu/qcom-clic",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = qcom_clic_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_BOOL_ARRAY(env.qcom_clic_irq, RISCVCPU, 65),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ const VMStateDescription vmstate_riscv_cpu = {
+@@ -529,2 +547,3 @@
+         &vmstate_mseccfg,
++        &vmstate_qcom_clic,
+         NULL

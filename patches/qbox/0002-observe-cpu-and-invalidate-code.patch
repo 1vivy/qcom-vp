@@ -1,0 +1,26 @@
+diff --git a/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h b/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
+--- a/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
++++ b/qemu-components/common/include/libqemu-cxx/libqemu-cxx.h
+@@ -708,4 +708,7 @@
+     int get_index() const;
++    uint64_t get_pc() const;
++    bool get_halted() const;
++    void invalidate_code(uint64_t address, uint64_t size);
+ 
+     void loop();
+     bool loop_is_busy();
+diff --git a/qemu-components/common/src/libqemu-cxx/cpu.cc b/qemu-components/common/src/libqemu-cxx/cpu.cc
+--- a/qemu-components/common/src/libqemu-cxx/cpu.cc
++++ b/qemu-components/common/src/libqemu-cxx/cpu.cc
+@@ -16,3 +16,11 @@
+ int Cpu::get_index() const { return m_int->exports().cpu_get_index(m_obj); }
++
++uint64_t Cpu::get_pc() const { return m_int->exports().cpu_get_pc(m_obj); }
++
++bool Cpu::get_halted() const { return m_int->exports().cpu_get_halted(m_obj); }
++
++void Cpu::invalidate_code(uint64_t address, uint64_t size) {
++    m_int->exports().cpu_invalidate_code(m_obj, address, size);
++}
+ 
+ void Cpu::loop() { m_int->exports().cpu_loop(m_obj); }

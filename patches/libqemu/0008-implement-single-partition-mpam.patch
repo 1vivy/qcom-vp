@@ -1,0 +1,220 @@
+From: qcom-vp maintainers
+Subject: [PATCH] arm: add opt-in single-partition MPAM v1.0 on TCG max
+
+Selected QSEE reads MPAM3_EL3 before feature discovery. QBox cannot define
+architectural CPU registers. Add a bounded MPAM profile inside QEMU, not
+an unknown-register fallback or a firmware patch. The profile has only
+PARTID=PMG=0, retains security state, and has no resource controllers.
+Implement enable aliases, reset values, reserved fields, EL permissions,
+EL3/EL2 traps, VHE aliases, and the existing NV2 redirection machinery.
+PAuth and host-backed RNDR/RNDRRS are unchanged.
+
+Source: Arm DDI 0601 (2024-03), MPAM register descriptions.
+https://developer.arm.com/documentation/ddi0601/2024-03/
+Readable Arm register pages:
+https://df.lth.se/~getz/ARM/SysReg/AArch64-mpam3_el3.html
+https://df.lth.se/~getz/ARM/SysReg/AArch64-mpamidr_el1.html
+
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -578,2 +578,7 @@
+         uint64_t vmecid_a_el2;
++
++        /* Opt-in single-partition MPAM architectural controls. */
++        uint64_t mpam3_el3;
++        uint64_t mpam2_el2;
++        uint64_t mpam1_el1;
+     } cp15;
+@@ -1003,6 +1008,8 @@
+     /* CPU has virtualization extension */
+     bool has_el2;
+     /* CPU has security extension */
+     bool has_el3;
++    /* TCG max CPU single-partition MPAM profile, disabled by default. */
++    bool qcom_mpam;
+     /* CPU has PMU (Performance Monitor Unit) */
+     bool has_pmu;
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -2336,8 +2336,9 @@
+         /* FEAT_AMU (Activity Monitors Extension) */
+         FIELD_DP64_IDREG(isar, ID_AA64PFR0, AMU, 0);
+         FIELD_DP32_IDREG(isar, ID_PFR0, AMU, 0);
+-        /* FEAT_MPAM (Memory Partitioning and Monitoring Extension) */
+-        FIELD_DP64_IDREG(isar, ID_AA64PFR0, MPAM, 0);
++        /* The opt-in profile implements MPAM v1.0 with zero-width IDs. */
++        FIELD_DP64_IDREG(isar, ID_AA64PFR0, MPAM, cpu->qcom_mpam ? 1 : 0);
++        FIELD_DP64_IDREG(isar, ID_AA64PFR1, MPAM_FRAC, 0);
+     }
+ 
+     /* MPU can be configured out of a PMSA CPU either by setting has-mpu
+--- a/target/arm/tcg/cpu64.c
++++ b/target/arm/tcg/cpu64.c
+@@ -1166,6 +1166,10 @@
+ void aarch64_max_tcg_initfn(Object *obj)
+ {
+     ARMCPU *cpu = ARM_CPU(obj);
+     ARMISARegisters *isar = &cpu->isar;
++#ifndef CONFIG_USER_ONLY
++    static const Property qcom_mpam_property =
++        DEFINE_PROP_BOOL("x-qcom-mpam", ARMCPU, qcom_mpam, false);
++#endif
+     uint64_t t;
+     uint32_t u;
+@@ -1448,2 +1452,5 @@
+     qdev_property_add_static(DEVICE(obj), &arm_cpu_lpa2_property);
++#ifndef CONFIG_USER_ONLY
++    qdev_property_add_static(DEVICE(obj), &qcom_mpam_property);
++#endif
+ }
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -5304 +5304,132 @@
++/*
++ * MPAM v1.0 with one PARTID and one PMG in each security space.
++ * MPAMIDR_EL1 reports zero widths and no optional virtualization controls.
++ * All requests therefore retain their existing security attributes and use
++ * PARTID=PMG=0. No memory-system partition or monitor is fabricated.
++ *
++ * Arm DDI 0601, MPAM{0,1,2,3}_ELx, MPAMIDR_EL1 and MPAMSM_EL1:
++ * https://developer.arm.com/documentation/ddi0601/2024-03/
++ */
++#define MPAM_ENABLE       (1ULL << 63)
++#define MPAM_TRAPLOWER    (1ULL << 62)
++#define MPAM_TRAP1        (1ULL << 48)
++#define MPAM_TRAP0        (1ULL << 49)
++#define MPAM_ENSM         (1ULL << 50)
++
++static CPAccessResult access_mpam(CPUARMState *env, const ARMCPRegInfo *ri,
++                                 bool isread)
++{
++    int el = arm_current_el(env);
++
++    /* MPAM1_EL12 with NVx=101 redirects before any MPAM trap check. */
++    if (el == 1 && ri->opc1 == 5 &&
++        (arm_hcr_el2_eff(env) & (HCR_NV2 | HCR_NV1 | HCR_NV)) ==
++        (HCR_NV2 | HCR_NV)) {
++        return CP_ACCESS_OK;
++    }
++    if (el < 3 && arm_feature(env, ARM_FEATURE_EL3) &&
++        (env->cp15.mpam3_el3 & MPAM_TRAPLOWER)) {
++        /* TCG does not execute instructions in external Debug state. */
++        return CP_ACCESS_TRAP_EL3;
++    }
++    if (el == 1 && arm_is_el2_enabled(env) && ri->crm == 5) {
++        if ((ri->opc1 == 0 && ri->opc2 == 0 &&
++             (env->cp15.mpam2_el2 & MPAM_TRAP1)) ||
++            (ri->opc2 == 1 && (env->cp15.mpam2_el2 & MPAM_TRAP0)) ||
++            (ri->opc2 == 3 && !(env->cp15.mpam2_el2 & MPAM_ENSM))) {
++            return CP_ACCESS_TRAP_EL2;
++        }
++    }
++    return CP_ACCESS_OK;
++}
++
++static uint64_t mpam_enable(CPUARMState *env)
++{
++    uint64_t value;
++
++    if (arm_feature(env, ARM_FEATURE_EL3)) {
++        value = env->cp15.mpam3_el3;
++    } else if (arm_feature(env, ARM_FEATURE_EL2)) {
++        value = env->cp15.mpam2_el2;
++    } else {
++        value = env->cp15.mpam1_el1;
++    }
++    return value & MPAM_ENABLE;
++}
++
++static uint64_t mpam_read(CPUARMState *env, const ARMCPRegInfo *ri)
++{
++    return (raw_read(env, ri) & ~MPAM_ENABLE) | mpam_enable(env);
++}
++
++static void mpam_write(CPUARMState *env, const ARMCPRegInfo *ri,
++                       uint64_t value)
++{
++    uint64_t mask = 0;
++
++    switch (ri->opc1) {
++    case 6:
++        mask = MPAM_ENABLE | MPAM_TRAPLOWER;
++        break;
++    case 4:
++        mask = MPAM_TRAP0 | MPAM_TRAP1;
++        if (cpu_isar_feature(aa64_sme, env_archcpu(env))) {
++            mask |= MPAM_ENSM;
++        }
++        if (!arm_feature(env, ARM_FEATURE_EL3)) {
++            mask |= MPAM_ENABLE;
++        }
++        break;
++    case 0:
++        if (!arm_feature(env, ARM_FEATURE_EL3) &&
++            !arm_feature(env, ARM_FEATURE_EL2)) {
++            mask = MPAM_ENABLE;
++        }
++        break;
++    default:
++        g_assert_not_reached();
++    }
++    raw_write(env, ri, value & mask);
++}
++
++static const ARMCPRegInfo qcom_mpam_reginfo[] = {
++    { .name = "MPAM3_EL3", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 6, .crn = 10, .crm = 5, .opc2 = 0,
++      .access = PL3_RW, .resetvalue = MPAM_TRAPLOWER,
++      .fieldoffset = offsetof(CPUARMState, cp15.mpam3_el3),
++      .writefn = mpam_write, .raw_writefn = raw_write },
++    { .name = "MPAM2_EL2", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 4, .crn = 10, .crm = 5, .opc2 = 0,
++      .access = PL2_RW, .accessfn = access_mpam,
++      .type = ARM_CP_EL3_NO_EL2_KEEP,
++      .resetvalue = MPAM_TRAP0 | MPAM_TRAP1,
++      .fieldoffset = offsetof(CPUARMState, cp15.mpam2_el2),
++      .readfn = mpam_read, .raw_readfn = raw_read,
++      .writefn = mpam_write, .raw_writefn = raw_write },
++    { .name = "MPAM1_EL1", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 0, .crn = 10, .crm = 5, .opc2 = 0,
++      .access = PL1_RW, .accessfn = access_mpam,
++      .nv2_redirect_offset = 0x900 | NV2_REDIR_NV1,
++      .vhe_redir_to_el2 = ENCODE_AA64_CP_REG(3, 4, 10, 5, 0),
++      .vhe_redir_to_el01 = ENCODE_AA64_CP_REG(3, 5, 10, 5, 0),
++      .fieldoffset = offsetof(CPUARMState, cp15.mpam1_el1),
++      .readfn = mpam_read, .raw_readfn = raw_read,
++      .writefn = mpam_write, .raw_writefn = raw_write },
++    { .name = "MPAM0_EL1", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 0, .crn = 10, .crm = 5, .opc2 = 1,
++      .access = PL1_RW, .accessfn = access_mpam,
++      .type = ARM_CP_CONST, .resetvalue = 0 },
++    { .name = "MPAMIDR_EL1", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 0, .crn = 10, .crm = 4, .opc2 = 4,
++      .access = PL1_R, .accessfn = access_mpam,
++      .type = ARM_CP_CONST, .resetvalue = 0 },
++};
++
++static const ARMCPRegInfo qcom_mpamsm_reginfo = {
++    .name = "MPAMSM_EL1", .state = ARM_CP_STATE_AA64,
++    .opc0 = 3, .opc1 = 0, .crn = 10, .crm = 5, .opc2 = 3,
++    .access = PL1_RW, .accessfn = access_mpam,
++    .type = ARM_CP_CONST, .resetvalue = 0,
++};
++
+ static CPAccessResult access_pauth(CPUARMState *env, const ARMCPRegInfo *ri,
+@@ -7551,3 +7682,9 @@
++    if (cpu->qcom_mpam) {
++        define_arm_cp_regs(cpu, qcom_mpam_reginfo);
++        if (cpu_isar_feature(aa64_sme, cpu)) {
++            define_one_arm_cp_reg(cpu, &qcom_mpamsm_reginfo);
++        }
++    }
+     if (cpu_isar_feature(aa64_pauth, cpu)) {
+         define_arm_cp_regs(cpu, pauth_reginfo);
+     }
+@@ -7874,3 +8011,4 @@
+         r2->raw_writefn = NULL;
+-        r2->accessfn = NULL;
++        /* MPAM's EL3 trap takes priority over the FEAT_NV EL2 trap. */
++        r2->accessfn = r->accessfn == access_mpam ? access_mpam : NULL;
+         r2->fieldoffset = 0;

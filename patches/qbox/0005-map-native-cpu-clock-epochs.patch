@@ -1,0 +1,127 @@
+diff --git a/qemu-components/common/include/cpu.h b/qemu-components/common/include/cpu.h
+--- a/qemu-components/common/include/cpu.h
++++ b/qemu-components/common/include/cpu.h
+@@ -175,3 +175,42 @@
+     uint64_t m_quantum_ns; // For convenience
++
++    // Native clocks have independent epochs. Only elapsed execution time crosses domains.
++    std::mutex m_clock_epoch_mutex;
++    int64_t m_native_clock_epoch = 0;
++    sc_core::sc_time m_systemc_clock_epoch = sc_core::SC_ZERO_TIME;
++    bool m_clock_epoch_valid = false;
++
++    void rebase_native_clock()
++    {
++        std::lock_guard<std::mutex> lock(m_clock_epoch_mutex);
++        m_native_clock_epoch = m_inst.get().get_virtual_clock();
++        m_systemc_clock_epoch = m_qk->get_current_time();
++        m_clock_epoch_valid = true;
++    }
++
++    sc_core::sc_time map_native_clock(int64_t now, sc_core::sc_time sc_now)
++    {
++        std::lock_guard<std::mutex> lock(m_clock_epoch_mutex);
++        if (!m_clock_epoch_valid || now < m_native_clock_epoch) {
++            m_native_clock_epoch = now;
++            m_systemc_clock_epoch = m_qk->get_current_time();
++            m_clock_epoch_valid = true;
++        }
++        auto mapped = m_systemc_clock_epoch +
++                      sc_core::sc_time(now - m_native_clock_epoch, sc_core::SC_NS);
++        // A paused instance can resume after the other instances advance SystemC.
++        if (mapped < sc_now) {
++            m_native_clock_epoch = now;
++            m_systemc_clock_epoch = sc_now;
++            mapped = sc_now;
++        }
++        return mapped;
++    }
++
++    void invalidate_native_clock()
++    {
++        std::lock_guard<std::mutex> lock(m_clock_epoch_mutex);
++        m_clock_epoch_valid = false;
++    }
+ 
+     /* Time synchronization strategy (quantum keeper or MCIPS), chosen at construction. */
+@@ -317,6 +356,5 @@
+      * Called by the QEMU iothread when the deadline timer expires. We kick the
+      * CPU out of its execution loop for it to call the end_of_loop_cb callback.
+-     * However, we should also handle the case that qemu is currently in 'sync'
+-     *  - by setting the time here, we will nudge the sync thread.
++     * A CPU already waiting in sync retains its fixed target until sync returns.
+      */
+     void deadline_timer_cb()
+@@ -328,11 +367,4 @@
+         if (!m_finished) {
+             rearm_deadline_timer();
+-
+-            /* Take this opportunity to set the time */
+-            int64_t now = m_inst.get().get_virtual_clock();
+-            sc_core::sc_time sc_t = sc_core::sc_time_stamp();
+-            if (sc_core::sc_time(now, sc_core::SC_NS) > sc_t) {
+-                m_qk->set(sc_core::sc_time(now, sc_core::SC_NS) - sc_t);
+-            }
+         }
+     }
+@@ -369,4 +401,5 @@
+         SCP_TRACE(())("Have work, running CPU");
+         m_qk->start();
++        rebase_native_clock();
+     }
+ 
+@@ -458,7 +491,7 @@
+         sc_core::sc_time sc_t = sc_core::sc_time_stamp();
+-        if (sc_core::sc_time(now, sc_core::SC_NS) > sc_t) {
+-            m_qk->set(sc_core::sc_time(now, sc_core::SC_NS) - sc_t);
+-        }
++        m_time_sync->get_local_time(now, sc_t);
+         // Important to allow QK to notify itself if it's waiting.
+         m_qk->sync();
++        // Exclude native time spent waiting for the fixed synchronization target.
++        rebase_native_clock();
+     }
+@@ -873,6 +906,8 @@
+         m_qemu_cpu.m_deadline_timer->del();
+         m_qemu_cpu.m_qk->stop();
++        m_qemu_cpu.invalidate_native_clock();
+     } else {
+         m_qemu_cpu.m_qk->start();
++        m_qemu_cpu.rebase_native_clock();
+         m_qemu_cpu.rearm_deadline_timer();
+     }
+@@ -888,3 +923,4 @@
+     m_qemu_cpu.m_qk->start(); // restart the QK if it's stopped
+     m_qemu_cpu.m_qk->reset();
++    m_qemu_cpu.rebase_native_clock();
+     m_qemu_cpu.m_qemu_kick_ev.async_notify(); // notify the other thread so that the CPU is allowed to continue
+@@ -898,3 +934,7 @@
+ 
+-inline void QemuCpu::QuantumKeeperSync::on_qk_start() { m_qemu_cpu.m_qk->start(); }
++inline void QemuCpu::QuantumKeeperSync::on_qk_start()
++{
++    m_qemu_cpu.m_qk->start();
++    m_qemu_cpu.rebase_native_clock();
++}
+ 
+@@ -904,12 +944,7 @@
+ {
+-    using sc_core::sc_time;
+-    using sc_core::SC_NS;
+-
+-    if (sc_time(vclock_now, SC_NS) > sc_t) {
+-        m_qemu_cpu.m_qk->set(sc_time(vclock_now, SC_NS) - sc_t);
+-        return m_qemu_cpu.m_qk->get_local_time();
+-    }
+-    return sc_core::SC_ZERO_TIME;
++    const auto mapped = m_qemu_cpu.map_native_clock(vclock_now, sc_t);
++    m_qemu_cpu.m_qk->set(mapped - sc_t);
++    return m_qemu_cpu.m_qk->get_local_time();
+ }
+ 
+ inline void QemuCpu::QuantumKeeperSync::set_local_time(const sc_core::sc_time& t)
+@@ -916,3 +951,4 @@
+ {
+     m_qemu_cpu.m_qk->set(t);
++    m_qemu_cpu.rebase_native_clock();
+ 

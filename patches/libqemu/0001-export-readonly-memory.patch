@@ -1,0 +1,13 @@
+diff --git a/libqemu/exports.py b/libqemu/exports.py
+index 0590dc9..5236be4 100755
+--- a/libqemu/exports.py
++++ b/libqemu/exports.py
+@@ -101,6 +101,8 @@
+ ExportedType('QemuIOMMUTLBEntry', 'IOMMUTLBEntry')
+ 
+ ExportedFct('memory_region_new', 'MemoryRegion *', [], priv = 'libqemu_memory_region_new')
++ExportedFct('memory_region_set_readonly', 'void', ['MemoryRegion *', 'bool'],
++        iothread_locked = True)
+ 
+ ExportedFct('memory_region_init', 'void',
+         [ 'MemoryRegion *', 'Object *', 'const char *', 'uint64_t' ])

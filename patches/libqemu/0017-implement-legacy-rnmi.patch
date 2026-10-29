@@ -1,0 +1,141 @@
+diff --git a/target/riscv/cpu_cfg_fields.h.inc b/target/riscv/cpu_cfg_fields.h.inc
+--- a/target/riscv/cpu_cfg_fields.h.inc
++++ b/target/riscv/cpu_cfg_fields.h.inc
+@@ -8,2 +8,3 @@
+ BOOL_FIELD(sifive_cease)
++BOOL_FIELD(legacy_rnmi)
+ BOOL_FIELD(sifive_cache_operations)
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -885,4 +885,7 @@
+     if (cpu->cfg.ext_smrnmi) {
+         env->rnmip = 0;
+-        env->mnstatus = set_field(env->mnstatus, MNSTATUS_NMIE, false);
++        /* Rocket resets with RNMI enabled and previous privilege M. */
++        env->mnstatus = cpu->cfg.legacy_rnmi ?
++            MNSTATUS_NMIE | (PRV_M << ctzl(MNSTATUS_MNPP)) :
++            set_field(env->mnstatus, MNSTATUS_NMIE, false);
+     }
+@@ -1033,1 +1036,6 @@
++    if (cpu->cfg.legacy_rnmi) {
++        /* Reuse Smrnmi interrupt state, exception routing, and MNRET. */
++        cpu->cfg.ext_smrnmi = true;
++    }
++
+     riscv_cpu_finalize_features(cpu, &local_err);
+@@ -2693,2 +2701,4 @@
+     DEFINE_PROP_BOOL("x-sifive-cease", RISCVCPU, cfg.sifive_cease, false),
++    DEFINE_PROP_BOOL("x-legacy-rnmi", RISCVCPU,
++                     cfg.legacy_rnmi, false),
+     DEFINE_PROP_BOOL("x-sifive-cache-operations", RISCVCPU,
+diff --git a/target/riscv/csr.c b/target/riscv/csr.c
+--- a/target/riscv/csr.c
++++ b/target/riscv/csr.c
+@@ -322,3 +322,12 @@
++static bool legacy_rnmi_csr(CPURISCVState *env, int csrno)
++{
++    return riscv_cpu_cfg(env)->legacy_rnmi &&
++           csrno >= CSR_MISELECT && csrno <= CSR_MIREG3;
++}
++
+ static RISCVException csrind_any(CPURISCVState *env, int csrno)
+ {
++    if (legacy_rnmi_csr(env, csrno)) {
++        return any(env, csrno);
++    }
+     if (!riscv_cpu_cfg(env)->ext_smcsrind) {
+@@ -331,3 +340,6 @@
+ static RISCVException csrind_or_aia_any(CPURISCVState *env, int csrno)
+ {
++    if (legacy_rnmi_csr(env, csrno)) {
++        return any(env, csrno);
++    }
+     if (!riscv_cpu_cfg(env)->ext_smaia && !riscv_cpu_cfg(env)->ext_smcsrind) {
+@@ -2458,1 +2470,65 @@
++static RISCVException write_mnstatus(CPURISCVState *env, int csrno,
++                                     target_ulong val, uintptr_t ra);
++
++/* Per-hart dispatch: never replace the process-wide indirect CSR table. */
++static RISCVException rmw_legacy_rnmi(CPURISCVState *env, int csrno,
++                                      target_ulong *val, target_ulong new_val,
++                                      target_ulong wr_mask)
++{
++    target_ulong old, next;
++    target_ulong status_mask = MNSTATUS_MNPP | MNSTATUS_MNPV | MNSTATUS_NMIE;
++
++    switch (csrno) {
++    case CSR_MISELECT:
++        old = env->mnscratch;
++        break;
++    case CSR_MIREG:
++        old = env->mnepc & ~(target_ulong)(riscv_has_ext(env, RVC) ? 1 : 3);
++        break;
++    case CSR_MIREG2:
++        old = env->mncause;
++        break;
++    case CSR_MIREG3:
++        /* Chisel MNStatus packs MPP[12:11], MPV[7], MIE[3].
++         * These match Smrnmi, but legacy has no MNPELP field.
++         */
++        old = env->mnstatus & status_mask;
++        break;
++    default:
++        g_assert_not_reached();
++    }
++    if (val) {
++        *val = old;
++    }
++    if (!wr_mask) {
++        return RISCV_EXCP_NONE;
++    }
++    next = (old & ~wr_mask) | (new_val & wr_mask);
++    switch (csrno) {
++    case CSR_MISELECT:
++        env->mnscratch = next;
++        break;
++    case CSR_MIREG:
++        env->mnepc = next & ~(target_ulong)(riscv_has_ext(env, RVC) ? 1 : 3);
++        break;
++    case CSR_MIREG2:
++        env->mncause = next & (BIT_ULL(TARGET_LONG_BITS - 1) | 3);
++        break;
++    case CSR_MIREG3:
++        /* Rocket legalizes privilege and permits setting, not clearing MIE. */
++        if (riscv_has_ext(env, RVS)) {
++            if (get_field(next, MNSTATUS_MNPP) == PRV_RESERVED) {
++                next = set_field(next, MNSTATUS_MNPP, PRV_U);
++            }
++        } else {
++            target_ulong priv = get_field(next, MNSTATUS_MNPP);
++            next = set_field(next, MNSTATUS_MNPP,
++                             riscv_has_ext(env, RVU) && !(priv & 1) ?
++                             PRV_U : PRV_M);
++        }
++        return write_mnstatus(env, CSR_MNSTATUS, next & status_mask, 0);
++    }
++    return RISCV_EXCP_NONE;
++}
++
+ static RISCVException rmw_xiselect(CPURISCVState *env, int csrno,
+@@ -2464,2 +2540,6 @@
+ 
++    if (legacy_rnmi_csr(env, csrno)) {
++        return rmw_legacy_rnmi(env, csrno, val, new_val, wr_mask);
++    }
++
+     ret = smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT);
+@@ -2903,2 +2983,6 @@
+ 
++    if (legacy_rnmi_csr(env, csrno)) {
++        return rmw_legacy_rnmi(env, csrno, val, new_val, wr_mask);
++    }
++
+     ret = smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT);
+@@ -2934,2 +3018,6 @@
+ 
++    if (legacy_rnmi_csr(env, csrno)) {
++        return rmw_legacy_rnmi(env, csrno, val, new_val, wr_mask);
++    }
++
+     ret = smstateen_acc_ok(env, 0, SMSTATEEN0_SVSLCT);

@@ -1,0 +1,23 @@
+-- SPDX-License-Identifier: BSD-3-Clause-Clear
+local root=assert(os.getenv('QCOM_VP_PROBE_ROOT'))..'/'
+platform={moduletype='Container',qemu_inst_mgr={moduletype='QemuInstanceManager'},
+    instance={moduletype='QemuInstance',args={'&qemu_inst_mgr','AARCH64'},accel='tcg',
+        sync_policy='multithread-quantum'},
+    cpu={moduletype='cpu_arm_cortexA53',args={'&instance'},rvbar=0x300000,
+        has_el3=true,has_el2=true,mem={bind='&access.target_socket'}},
+    access={moduletype='AccessMonitor',initiator_socket={bind='&router.target_socket'}},
+    router={moduletype='router'},system_router={moduletype='router'},
+    rom={moduletype='gs_memory',read_only=true,
+        target_socket={address=0x300000,size=0x10000,bind='&router.initiator_socket'},
+        load={{bin_file=root..'producer.bin',offset=0}}},
+    stack={moduletype='gs_memory',init_mem=true,
+        target_socket={address=0x14000000,size=0x1000,bind='&router.initiator_socket'}},
+    windows={moduletype='qcom,pdp-address-windows-v1',
+        registers={address=0x40990000,size=0x1d0c,bind='&router.initiator_socket'},
+        memory={address=0x80000000,size=0x80000000,relative_addresses=false,
+            bind='&router.initiator_socket'},
+        output={bind='&system_router.target_socket'}},
+    small={moduletype='gs_memory',init_mem=true,
+        target_socket={address=0x813d0000,size=0x20000,bind='&system_router.initiator_socket'}},
+    large={moduletype='gs_memory',init_mem=true,
+        target_socket={address=0x82000000,size=0x80000,bind='&system_router.initiator_socket'}}}

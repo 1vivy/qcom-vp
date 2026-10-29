@@ -1,0 +1,95 @@
+Subject: [PATCH] Honor WriteBooster hibernation flush policy
+
+Retain the standard hibernation flush flag through the existing query path.
+Select the active or hibernating policy in the existing idle flush engine.
+The engine retains its occupancy accounting and partial-flush behavior.
+SCSI still performs the actual writes against the existing block backends.
+
+--- a/hw/ufs/ufs.c
++++ b/hw/ufs/ufs.c
+@@ -1402,10 +1402,11 @@
+     [UFS_QUERY_FLAG_IDN_WB_BUFF_FLUSH_EN] =
+         UFS_QUERY_FLAG_READ | UFS_QUERY_FLAG_SET | UFS_QUERY_FLAG_CLEAR |
+         UFS_QUERY_FLAG_TOGGLE,
+-    /* TODO: Revisit after PM implementation */
+-    [UFS_QUERY_FLAG_IDN_WB_BUFF_FLUSH_DURING_HIBERN8] = UFS_QUERY_FLAG_READ,
++    [UFS_QUERY_FLAG_IDN_WB_BUFF_FLUSH_DURING_HIBERN8] =
++        UFS_QUERY_FLAG_READ | UFS_QUERY_FLAG_SET | UFS_QUERY_FLAG_CLEAR |
++        UFS_QUERY_FLAG_TOGGLE,
+     [UFS_QUERY_FLAG_IDN_UNPIN_EN] = UFS_QUERY_FLAG_READ | UFS_QUERY_FLAG_SET |
+                                     UFS_QUERY_FLAG_CLEAR |
+                                     UFS_QUERY_FLAG_TOGGLE,
+ };
+ 
+@@ -1500,6 +1501,9 @@
+     case UFS_QUERY_FLAG_IDN_WB_BUFF_FLUSH_EN:
+         u->flags.wb_buffer_flush_en = value;
+         break;
++    case UFS_QUERY_FLAG_IDN_WB_BUFF_FLUSH_DURING_HIBERN8:
++        u->flags.wb_buffer_flush_during_hibernate = value;
++        break;
+     case UFS_QUERY_FLAG_IDN_UNPIN_EN:
+         u->flags.unpin_en = value;
+         break;
+@@ -2539,13 +2543,15 @@
+     UfsWb *wb = &u->wb;
+     uint64_t flush_bytes, total_flush_bytes;
++    bool flush_enabled = u->pa_hibernating ?
++        u->flags.wb_buffer_flush_during_hibernate : u->flags.wb_buffer_flush_en;
+ 
+     switch (u->attributes.wb_buffer_flush_status) {
+     case UFS_WB_FLUSH_IDLE:
+     case UFS_WB_FLUSH_SUSPENDED:
+-        if (!u->flags.wb_buffer_flush_en || !ufs_wb_total_flush_bytes(u)) {
++        if (!flush_enabled || !ufs_wb_total_flush_bytes(u)) {
+             break;
+         }
+ 
+         u->attributes.wb_buffer_flush_status = UFS_WB_FLUSH_IN_PROGRESS;
+         /* fallthrough */
+     case UFS_WB_FLUSH_IN_PROGRESS:
+@@ -2552,7 +2558,7 @@
+-        if (!u->flags.wb_buffer_flush_en) {
++        if (!flush_enabled) {
+             u->attributes.wb_buffer_flush_status = UFS_WB_FLUSH_SUSPENDED;
+             break;
+         }
+ 
+         total_flush_bytes = ufs_wb_total_flush_bytes(u);
+         if (!total_flush_bytes) {
+@@ -2577,7 +2583,7 @@
+     case UFS_WB_FLUSH_COMPLETED:
+         if (ufs_wb_total_flush_bytes(u)) {
+             u->attributes.wb_buffer_flush_status =
+-                (u->flags.wb_buffer_flush_en) ? UFS_WB_FLUSH_IN_PROGRESS :
+-                                                UFS_WB_FLUSH_IDLE;
++                flush_enabled ? UFS_WB_FLUSH_IN_PROGRESS :
++                                UFS_WB_FLUSH_IDLE;
+         }
+     }
+@@ -2772,7 +2778,7 @@
+ static void ufs_idle_timer_cb(void *opaque)
+ {
+     UfsHc *u = opaque;
+-    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL_RT);
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+ 
+     if (ufs_check_idle(u) && ufs_mcq_check_idle(u)) {
+         ufs_process_idle(u);
+@@ -2939,7 +2945,7 @@
+     uint32_t ext_wb_sup = WB_RESIZE | WB_FIFO | WB_PINNED;
+     uint32_t ext_ufs_feat_sup = UFS_DEV_WB_SUPPORT | UFS_DEV_HIGH_TEMP_NOTIF |
+                                 UFS_DEV_LOW_TEMP_NOTIF | UFS_DEV_HID_SUPPORT;
+-    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL_RT);
++    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+ 
+     u->reg_size = pow2ceil(ufs_reg_size(u));
+ 
+@@ -3071,6 +3077,6 @@
+      */
+     u->temperature = UFS_TEMPERATURE;
+ 
+-    timer_init_ms(&u->idle_timer, QEMU_CLOCK_VIRTUAL_RT, ufs_idle_timer_cb, u);
++    timer_init_ms(&u->idle_timer, QEMU_CLOCK_VIRTUAL, ufs_idle_timer_cb, u);
+     timer_mod(&u->idle_timer, now + UFS_IDLE_TIMER_TICK);
+ }

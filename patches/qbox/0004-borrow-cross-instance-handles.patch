@@ -1,0 +1,36 @@
+diff --git a/qemu-components/common/include/ports/initiator.h b/qemu-components/common/include/ports/initiator.h
+--- a/qemu-components/common/include/ports/initiator.h
++++ b/qemu-components/common/include/ports/initiator.h
+@@ -532,7 +532,7 @@
+             return;
+         }
+ 
+-        qemu::MemoryRegion target_mr(ext->get_mr());
++        qemu::MemoryRegion& target_mr = ext->get_mr();
+ 
+         if (target_mr.get_inst_id() != m_dev.get_inst_id()) {
+             return;
+diff --git a/qemu-components/common/include/ports/qemu-target-signal-socket.h b/qemu-components/common/include/ports/qemu-target-signal-socket.h
+--- a/qemu-components/common/include/ports/qemu-target-signal-socket.h
++++ b/qemu-components/common/include/ports/qemu-target-signal-socket.h
+@@ -86,7 +86,7 @@
+      *
+      * @return the GPIO wrapped by this socket
+      */
+-    qemu::Gpio get_gpio() { return m_gpio_in; }
++    qemu::Gpio& get_gpio() { return m_gpio_in; }
+ 
+     /**
+      * @brief Force a notification on the default event
+diff --git a/qemu-components/common/include/tlm-extensions/qemu-mr-hint.h b/qemu-components/common/include/tlm-extensions/qemu-mr-hint.h
+--- a/qemu-components/common/include/tlm-extensions/qemu-mr-hint.h
++++ b/qemu-components/common/include/tlm-extensions/qemu-mr-hint.h
+@@ -33,7 +33,7 @@
+         m_offset = static_cast<const QemuMrHintTlmExtension&>(ext).m_offset;
+     }
+ 
+-    qemu::MemoryRegion get_mr() const { return m_mr; }
++    qemu::MemoryRegion& get_mr() { return m_mr; }
+     uint64_t get_offset() const { return m_offset; }
+ };
+ 

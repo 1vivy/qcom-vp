@@ -1,0 +1,103 @@
+Subject: [PATCH] Describe the actual UFS configuration
+
+Construct the read-only configuration descriptor from the existing device
+and logical units. One virtual allocation unit holds one 4096-byte block,
+so configuration, geometry, and logical capacity describe the same media.
+The existing descriptor lock and write rejection remain unchanged.
+
+The eight-entry layout follows the public ufs-utils field definitions:
+https://github.com/SanDisk-Open-Source/ufs-utils/blob/dev/ufs_cmds.c
+
+--- a/hw/ufs/ufs.c
++++ b/hw/ufs/ufs.c
+@@ -24,6 +24,7 @@
+ #include "qemu/osdep.h"
++#include "qemu/bswap.h"
+ #include "hw/core/irq.h"
+ #include "migration/vmstate.h"
+ #include "qapi/error.h"
+ #include "ufs.h"
+ #include "scsi/constants.h"
+@@ -2183,6 +2184,52 @@
+     return desc;
+ }
+ 
++static QueryRespCode ufs_read_config_desc(UfsRequest *req)
++{
++    enum { HEADER = 0x16, STRIDE = 0x1a, LUNS = 8, SIZE = HEADER + STRIDE * LUNS };
++    UfsHc *u = req->hc;
++    const DeviceDescriptor *device = &u->device_desc;
++    uint8_t *data = req->rsp_upiu.qr.data;
++
++    if (req->req_upiu.qr.index != 0) {
++        return UFS_QUERY_RESULT_INVALID_INDEX;
++    }
++    for (unsigned i = LUNS; i < UFS_MAX_LUS; ++i) {
++        if (u->lus[i]) {
++            return UFS_QUERY_RESULT_NOT_READABLE;
++        }
++    }
++    memset(data, 0, SIZE);
++    data[0] = SIZE;
++    data[1] = UFS_QUERY_DESC_IDN_CONFIGURATION;
++    memcpy(data + 3, &device->boot_enable, 5);
++    data[8] = device->init_active_icc_level;
++    memcpy(data + 9, &device->periodic_rtc_update, 2);
++    memcpy(data + 0x10, &device->write_booster_buffer_preserve_user_space_en, 6);
++
++    for (unsigned i = 0; i < LUNS; ++i) {
++        if (!u->lus[i]) {
++            continue;
++        }
++        const UnitDescriptor *unit = &u->lus[i]->unit_desc;
++        uint8_t *entry = data + HEADER + i * STRIDE;
++        /* One virtual allocation unit holds one logical block. */
++        uint64_t units = be64_to_cpu(unit->logical_block_count);
++        if (units > UINT32_MAX) {
++            return UFS_QUERY_RESULT_NOT_READABLE;
++        }
++        memcpy(entry, &unit->lu_enable, 3);
++        entry[3] = unit->memory_type;
++        stl_be_p(entry + 4, units);
++        entry[8] = unit->data_reliability;
++        entry[9] = unit->logical_block_size;
++        entry[10] = unit->provisioning_type;
++        memcpy(entry + 11, &unit->context_capabilities, 2);
++        memcpy(entry + 0x16, &unit->lu_num_write_booster_buffer_alloc_units, 4);
++    }
++    return UFS_QUERY_RESULT_SUCCESS;
++}
++
+ static QueryRespCode ufs_read_desc(UfsRequest *req)
+ {
+     UfsHc *u = req->hc;
+@@ -2200,6 +2247,9 @@
+         status = UFS_QUERY_RESULT_SUCCESS;
+         break;
++    case UFS_QUERY_DESC_IDN_CONFIGURATION:
++        status = ufs_read_config_desc(req);
++        break;
+     case UFS_QUERY_DESC_IDN_UNIT:
+         status = ufs_read_unit_desc(req);
+         break;
+     case UFS_QUERY_DESC_IDN_GEOMETRY:
+@@ -2967,7 +3017,8 @@
+     u->geometry_desc.descriptor_idn = UFS_QUERY_DESC_IDN_GEOMETRY;
+     u->geometry_desc.max_number_lu = (UFS_MAX_LUS == 32) ? 0x1 : 0x0;
+-    u->geometry_desc.segment_size = cpu_to_be32(0x2000); /* 4MB: 8192 * 512B */
+-    u->geometry_desc.allocation_unit_size = 0x1; /* 4MB: 1 segment */
++    /* The virtual allocation quantum matches one backed logical block. */
++    u->geometry_desc.segment_size = cpu_to_be32(1 << (UFS_BLOCK_SIZE_SHIFT - 9));
++    u->geometry_desc.allocation_unit_size = 1;
+     u->geometry_desc.min_addr_block_size = 0x8; /* 4KB */
+     u->geometry_desc.max_in_buffer_size = 0x8;
+     u->geometry_desc.max_out_buffer_size = 0x8;
+@@ -2996,7 +3047,7 @@
+     u->attributes.max_data_in_size = 0x08;
+     u->attributes.max_data_out_size = 0x08;
+     u->attributes.ref_clk_freq = 0x01; /* 26 MHz */
+-    /* configure descriptor is not supported */
++    /* Guest software cannot change the backing-media configuration. */
+     u->attributes.config_descr_lock = 0x01;
+     u->attributes.max_num_of_rtt = 0x02;
+     u->attributes.device_too_high_temp_boundary = UFS_TOO_HIGH_TEMP_BOUNDARY;

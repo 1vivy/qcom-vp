@@ -1,0 +1,23 @@
+-- SPDX-License-Identifier: BSD-3-Clause-Clear
+local root=assert(os.getenv('QCOM_VP_PROBE_ROOT'))..'/'
+platform={moduletype='Container',qemu_inst_mgr={moduletype='QemuInstanceManager'},
+    apss_instance={moduletype='QemuInstance',args={'&qemu_inst_mgr','AARCH64'},accel='tcg',
+        sync_policy='multithread-quantum',qemu_args='-d in_asm -D '..root..'producer.log'},
+    apss_router={moduletype='router'},
+    apss_access={moduletype='AccessMonitor',initiator_socket={bind='&apss_router.target_socket'}},
+    apss={moduletype='cpu_arm_cortexA53',args={'&apss_instance'},rvbar=0x300000,
+        has_el3=true,has_el2=true,mem={bind='&apss_access.target_socket'}},
+    rom={moduletype='gs_memory',read_only=true,
+        target_socket={address=0x300000,size=0x2000,bind='&apss_router.initiator_socket'},
+        load={{bin_file=root..'producer.bin',offset=0}}},
+    pmic={moduletype='qcom,virtual-pmic-registers-v1',identities='0 0 1 1 0 2 0',
+        registers='0 0 0x1650 0 0xff',
+        absent_peripherals='0 0 4',pon_peripherals='0 0 8',
+        sdam_peripherals='0 0 0x70 1',gpio_peripherals='0 0 0x88 1',
+        clock_peripherals='0 0 0x50 1',rtc_status_peripherals='0 0 0x61',
+        regulator_peripherals='0 0 0xc1 4',pbs_peripherals='0 0 0x16 0x0501 0 0x1000'},
+    spmi={moduletype='qcom,spmi-arbiter-packed-v1',secure_write_owner_mask=0x801,
+        completion_policy='synchronous-virtual',
+        target_socket={address=0x0c400000,size=0x900000,bind='&apss_router.initiator_socket'},
+        dcp_socket={address=0x4c400000,size=0x900000,bind='&apss_router.initiator_socket'},
+        pmic_socket={bind='&pmic.target_socket'}}}

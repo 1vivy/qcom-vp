@@ -1,0 +1,49 @@
+From: qcom-vp maintainers
+Subject: [PATCH] arm: add MPAMHCR_EL2 to the opt-in MPAM profile
+
+QHEE writes MPAM2_EL2 and then MPAMHCR_EL2 at image offsets 0x52934 and
+0x5293c. QEMU has no MPAMHCR_EL2, so the write raises an Undefined
+Instruction exception at EL2. QHEE then stops in its unknown-trap handler with
+"Unhandled EL2 trap" and never enables its interrupts.
+
+The genuine firmware executes that store, so the silicon provides the register.
+MPAMIDR_EL1 therefore reports HAS_HCR one, and MPAMHCR_EL2 exists as a retained
+word. The profile still declares no resource controller, monitor, or partition,
+and it stays off by default.
+
+Source: Arm DDI 0601 (2024-03), MPAMIDR_EL1 HAS_HCR and MPAMHCR_EL2.
+https://developer.arm.com/documentation/ddi0601/2024-03/
+
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -581,6 +581,8 @@
+         uint64_t mpam3_el3;
+         uint64_t mpam2_el2;
+         uint64_t mpam1_el1;
++        /* Opt-in MPAM hypervisor control. */
++        uint64_t mpamhcr_el2;
+         /* Opt-in trace filter control, no trace hardware behind it. */
+         uint64_t trfcr_el2;
+     } cp15;
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -5419,10 +5419,18 @@
+       .opc0 = 3, .opc1 = 0, .crn = 10, .crm = 5, .opc2 = 1,
+       .access = PL1_RW, .accessfn = access_mpam,
+       .type = ARM_CP_CONST, .resetvalue = 0 },
++    /* HAS_HCR is bit zero. The hypervisor control below implements it, and
++     * the genuine firmware writes that register, so both must be present. */
+     { .name = "MPAMIDR_EL1", .state = ARM_CP_STATE_AA64,
+       .opc0 = 3, .opc1 = 0, .crn = 10, .crm = 4, .opc2 = 4,
+       .access = PL1_R, .accessfn = access_mpam,
+-      .type = ARM_CP_CONST, .resetvalue = 0 },
++      .type = ARM_CP_CONST, .resetvalue = 1 },
++    /* The hypervisor control word. QHEE writes it before it starts the guest.
++     * No resource controller exists, so the value is retained only. */
++    { .name = "MPAMHCR_EL2", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 4, .crn = 10, .crm = 4, .opc2 = 0,
++      .access = PL2_RW, .resetvalue = 0,
++      .fieldoffset = offsetof(CPUARMState, cp15.mpamhcr_el2) },
+ };
+ 
+ static const ARMCPRegInfo qcom_mpamsm_reginfo = {

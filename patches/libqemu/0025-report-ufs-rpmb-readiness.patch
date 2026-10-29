@@ -1,0 +1,12 @@
+--- a/hw/ufs/lu.c
++++ b/hw/ufs/lu.c
+@@ -320,7 +320,8 @@ static UfsReqResult ufs_emulate_scsi_cmd(UfsLu *lu, UfsRequest *req)
+     case TEST_UNIT_READY: {
+         const uint8_t *cdb = req->req_upiu.sc.cdb;
+         UfsHc *u = req->hc;
+-        if (lun != UFS_UPIU_UFS_DEVICE_WLUN) {
++        if (lun != UFS_UPIU_UFS_DEVICE_WLUN &&
++            lun != UFS_UPIU_RPMB_WLUN) {
+             scsi_build_sense(sense_buf, SENSE_CODE(INVALID_OPCODE));
+             scsi_status = CHECK_CONDITION;
+         } else if (req->data_len || req->req_upiu.sc.exp_data_transfer_len ||

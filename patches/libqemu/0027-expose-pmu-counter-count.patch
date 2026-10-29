@@ -1,0 +1,68 @@
+From: qcom-vp maintainers
+Subject: [PATCH] arm: expose the PMU event counter count on TCG max
+
+QHEE saves and restores PMEVCNTR0..11_EL0 and PMEVTYPER0..11_EL0 for each
+vCPU context switch without reading PMCR_EL0.N. The TCG max core reports
+six counters, so PMEVCNTR6_EL0 traps as an unsupported system register and
+QHEE loops on the Undefined Instruction exception.
+
+Expose the count as an opt-in property so a profile can state the counter
+capacity that its firmware needs. QEMU derives the PMEVCNTR<n> and
+PMEVTYPER<n> registers, the counter masks and MDCR_EL2.HPMN from
+PMCR_EL0.N, so the property sets that field before the registers exist.
+The default of zero keeps the CPU model value.
+
+Source: Arm DDI 0487 (Arm Architecture Reference Manual), PMCR_EL0.N.
+https://developer.arm.com/documentation/ddi0487/
+
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -1020,6 +1020,8 @@
+     bool qcom_mpam;
+     /* TCG max CPU Qualcomm identification profile, disabled by default. */
+     bool qcom_ids;
++    /* TCG max CPU PMU event counter count; zero keeps the CPU model value. */
++    uint8_t qcom_pmu_counters;
+     /* CPU has PMU (Performance Monitor Unit) */
+     bool has_pmu;
+     /* CPU has VFP */
+--- a/target/arm/tcg/cpu64.c
++++ b/target/arm/tcg/cpu64.c
+@@ -1174,6 +1174,9 @@
+         DEFINE_PROP_BOOL("x-qcom-ids", ARMCPU, qcom_ids, false);
+     static const Property qcom_gic_lr_property =
+         DEFINE_PROP_INT32("x-qcom-gic-num-lrs", ARMCPU, gic_num_lrs, 4);
++    static const Property qcom_pmu_counters_property =
++        DEFINE_PROP_UINT8("x-qcom-pmu-num-counters", ARMCPU,
++                          qcom_pmu_counters, 0);
+ #endif
+     uint64_t t;
+     uint32_t u;
+@@ -1458,6 +1461,7 @@
+     qdev_property_add_static(DEVICE(obj), &qcom_mpam_property);
+     qdev_property_add_static(DEVICE(obj), &qcom_ids_property);
+     qdev_property_add_static(DEVICE(obj), &qcom_gic_lr_property);
++    qdev_property_add_static(DEVICE(obj), &qcom_pmu_counters_property);
+ #endif
+ }
+ 
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -2455,6 +2455,17 @@
+     }
+ #endif
+ 
++    if (cpu->qcom_pmu_counters) {
++        if (cpu->qcom_pmu_counters > 31) {
++            error_setg(errp, "x-qcom-pmu-num-counters must be 1 through 31");
++            return;
++        }
++        /* PMCR_EL0.N defines the PMEVCNTR<n> and PMEVTYPER<n> registers. */
++        cpu->isar.reset_pmcr_el0 = deposit64(cpu->isar.reset_pmcr_el0,
++                                             PMCRN_SHIFT, 5,
++                                             cpu->qcom_pmu_counters);
++    }
++
+     register_cp_regs_for_features(cpu);
+     arm_cpu_register_gdb_regs_for_features(cpu);
+     arm_cpu_register_gdb_commands(cpu);

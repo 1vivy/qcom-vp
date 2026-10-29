@@ -1,0 +1,21 @@
+From: qcom-vp maintainers
+Subject: [PATCH] riscv: stop lookahead at the translation limit
+
+An I/O fetch limits a translation block to one instruction.
+An aligned fetch records four bytes, even for a compressed instruction.
+The page-end lookahead can then record the second halfword again.
+Skip that lookahead when the block reaches its instruction limit.
+Keep the byte-recording assertions and normal page checks.
+
+--- a/target/riscv/translate.c
++++ b/target/riscv/translate.c
+@@ -1575,7 +1575,8 @@
+     }
+ 
+     /* Only the first insn within a TB is allowed to cross a page boundary. */
+-    if (ctx->base.is_jmp == DISAS_NEXT) {
++    if (ctx->base.is_jmp == DISAS_NEXT &&
++        ctx->base.num_insns < ctx->base.max_insns) {
+         if (ctx->itrigger || !translator_is_same_page(&ctx->base, ctx->base.pc_next)) {
+             ctx->base.is_jmp = DISAS_TOO_MANY;
+         } else {

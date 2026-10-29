@@ -1,0 +1,68 @@
+From: qcom-vp maintainers
+Subject: [PATCH] riscv: expose an opt-in WFI output pulse
+
+A board power controller needs to know when the hart executes WFI.
+The opt-in x-qcom-wfi-output property adds the named output qcom.wfi.
+Each executed WFI pulses that output before the hart halts.
+The pulse reports the instruction. It does not change halt or wake rules.
+
+--- a/target/riscv/cpu_cfg_fields.h.inc
++++ b/target/riscv/cpu_cfg_fields.h.inc
+@@ -8,3 +8,4 @@
+ BOOL_FIELD(sifive_cease)
+ BOOL_FIELD(sifive_cache_operations)
++BOOL_FIELD(qcom_wfi_output)
+ BOOL_FIELD(ext_zba)
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -654,4 +654,6 @@
+     const GPtrArray *decoders_16;
+     const GPtrArray *decoders_32;
+     const GPtrArray *decoders_48;
++    /* Optional board output. Each executed WFI pulses this line. */
++    qemu_irq qcom_wfi;
+ };
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -1244,4 +1244,5 @@
+     qdev_init_gpio_in_named(DEVICE(cpu), riscv_cpu_set_nmi,
+                             "riscv.cpu.rnmi", RNMI_MAX);
++    qdev_init_gpio_out_named(DEVICE(cpu), &cpu->qcom_wfi, "qcom.wfi", 1);
+ 
+     if (mcc->def->num_triggers) {
+@@ -2698,4 +2699,6 @@
+     DEFINE_PROP_BOOL("x-sifive-cache-operations", RISCVCPU,
+                      cfg.sifive_cache_operations, false),
++    DEFINE_PROP_BOOL("x-qcom-wfi-output", RISCVCPU,
++                     cfg.qcom_wfi_output, false),
+     DEFINE_PROP_BOOL("x-qcom-clic", RISCVCPU, cfg.qcom_clic, false),
+     DEFINE_PROP_BOOL("x-qcom-retained-power", RISCVCPU, cfg.qcom_retained_power, false),
+--- a/target/riscv/op_helper.c
++++ b/target/riscv/op_helper.c
+@@ -29,4 +29,8 @@
+ #include "exec/helper-proto.h"
+ #include "exec/tlb-flags.h"
+ #include "trace.h"
++#ifndef CONFIG_USER_ONLY
++#include "hw/core/irq.h"
++#include "qemu/main-loop.h"
++#endif
+ 
+@@ -603,4 +607,17 @@
+             env->qcom_power_sleeping = true;
+         }
++#ifndef CONFIG_USER_ONLY
++        if (riscv_cpu_cfg(env)->qcom_wfi_output) {
++            /* Board GPIO consumers require the BQL. */
++            const bool locked = bql_locked();
++            if (!locked) {
++                bql_lock();
++            }
++            qemu_irq_pulse(env_archcpu(env)->qcom_wfi);
++            if (!locked) {
++                bql_unlock();
++            }
++        }
++#endif
+         cs->halted = 1;
+         cs->exception_index = EXCP_HLT;

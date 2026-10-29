@@ -1,0 +1,72 @@
+Subject: [PATCH] arm: add an explicit CPACR_EL1 FPEN reset policy
+
+Add an unsigned reset-fpen property for AArch64 system CPUs. Keep its default
+at zero and reject values outside the two-bit FPEN field during realization.
+Apply the selected value only at reset through the existing cpacr_write()
+path. Feature masks, access checks, and guest register writes stay unchanged.
+
+The architectural FPEN warm-reset value is UNKNOWN. This property selects
+a virtual reset policy. It does not claim a measured silicon reset value.
+Source: https://df.lth.se/~getz/ARM/SysReg/AArch64-cpacr_el1.html
+
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -1115,6 +1115,7 @@
+     uint32_t reset_fpsid;
+     uint64_t ctr;
+     uint32_t reset_sctlr;
++    uint32_t reset_fpen;
+     uint64_t pmceid0;
+     uint64_t pmceid1;
+     uint64_t mp_affinity; /* MP ID without feature bits */
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -1320,6 +1320,9 @@
+ static const Property arm_cpu_reset_hivecs_property =
+             DEFINE_PROP_BOOL("reset-hivecs", ARMCPU, reset_hivecs, false);
+ 
++static const Property arm_cpu_reset_fpen_property =
++            DEFINE_PROP_UINT32("reset-fpen", ARMCPU, reset_fpen, 0);
++
+ static const Property arm_cpu_has_el2_property =
+             DEFINE_PROP_BOOL("has_el2", ARMCPU, has_el2, true);
+ 
+@@ -1585,6 +1588,10 @@
+         qdev_property_add_static(DEVICE(obj), &arm_cpu_reset_hivecs_property);
+     }
+ 
++    if (arm_feature(&cpu->env, ARM_FEATURE_AARCH64)) {
++        qdev_property_add_static(DEVICE(obj), &arm_cpu_reset_fpen_property);
++    }
++
+     if (arm_feature(&cpu->env, ARM_FEATURE_V8)) {
+         object_property_add_uint64_ptr(obj, "rvbar",
+                                        &cpu->rvbar_prop,
+@@ -1856,6 +1863,16 @@
+     }
+ 
+ #ifndef CONFIG_USER_ONLY
++    if (cpu->reset_fpen > 3) {
++        error_setg(errp, "reset-fpen must be between 0 and 3");
++        return;
++    }
++    if (cpu->reset_fpen && !arm_feature(env, ARM_FEATURE_AARCH64)) {
++        error_setg(errp,
++                   "Cannot set nonzero reset-fpen with aarch64 disabled");
++        return;
++    }
++
+     /* The NVIC and M-profile CPU are two halves of a single piece of
+      * hardware; trying to use one without the other is a command line
+      * error and will result in segfaults if not caught here.
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -620,7 +620,7 @@
+      * Call cpacr_write() so that we reset with the correct RAO bits set
+      * for our CPU features.
+      */
+-    cpacr_write(env, ri, 0);
++    cpacr_write(env, ri, (uint64_t)env_archcpu(env)->reset_fpen << 20);
+ }
+ 
+ static CPAccessResult cpacr_access(CPUARMState *env, const ARMCPRegInfo *ri,

@@ -1,0 +1,441 @@
+From: qcom-vp maintainers
+Subject: [PATCH] arm: implement Qualcomm AMUv1 activity monitors on TCG max
+
+The genuine SM8850 kernel runs __cpu_setup at image offsets
+0xc97736ec..0xc97736f8. It reads ID_AA64PFR0_EL1.AMU, finds the feature
+present under the opt-in x-qcom-ids profile, and executes
+`msr amuserenr_el0, xzr`. The pinned CPU model defines no AMUv1 system
+register behind that identification claim, so the write takes an
+Undefined Instruction exception at EL1. UEFI's stale nonsecure vectors
+catch it, and the kernel parks before any console output.
+
+Add a minimum functional FEAT_AMUv1 implementation under the existing
+x-qcom-ids profile. It adds AMCR_EL0, AMCFGR_EL0, AMCGCR_EL0,
+AMUSERENR_EL0, AMCNTENSET0/1_EL0, and AMCNTENCLR0/1_EL0. It adds four
+architected AMEVCNTR0<n>_EL0 counters with their fixed AMEVTYPER0<n>_EL0
+event words. It adds eight auxiliary AMEVCNTR1<n>_EL0/AMEVTYPER1<n>_EL0
+pairs. Access control follows Arm DDI 0601. AMUSERENR_EL0.EN gates EL0
+access and HCR_EL2.TGE picks the trap target. CPTR_EL2.TAM and
+CPTR_EL3.TAM trap EL1/EL2 access. A write to a controlling register
+outside AMUSERENR_EL0 takes an Undefined Instruction exception unless the
+current EL is the highest implemented EL. That rule keeps counter enable
+under firmware control, the same rule Arm specifies.
+
+CPU_CYCLES and CNT_CYCLES count from QEMU_CLOCK_VIRTUAL, the timeline
+that already clocks the generic timer. CPU_CYCLES uses a declared 1 GHz
+virtual core frequency. CNT_CYCLES uses the generic timer counter value.
+INST_RETIRED counts retired instructions only when QEMU uses precise
+icount. Without precise icount it has no source, so it retains the last
+guest write and does not follow a clock. STALL_BACKEND_MEM and the
+auxiliary counters also have no source, and each one retains the guest's
+last write while disabled. docs/qcom/sm88xx/stubs.md records these source limits.
+AMCFGR_EL0 and AMCGCR_EL0 move out of the trace-only qcom_ids_reginfo
+array into the new AMU array. Their reported words do not change.
+
+Source: Arm DDI 0601 (2024-03), AMCR_EL0, AMCFGR_EL0, AMCGCR_EL0,
+AMUSERENR_EL0, AMCNTENSET0/1_EL0, AMCNTENCLR0/1_EL0, AMEVCNTR0<n>_EL0,
+AMEVTYPER0<n>_EL0, AMEVCNTR1<n>_EL0, and AMEVTYPER1<n>_EL0.
+https://developer.arm.com/documentation/ddi0601/2024-03/
+
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -588,6 +588,20 @@
+         /* Opt-in trace programmer model: program control and buffer limit. */
+         uint64_t trcprgctlr;
+         uint64_t trblimitr_el1;
++        /*
++         * Opt-in AMUv1 activity monitors. amu_cnt holds the accumulated
++         * count at the last fold (group 0 counters 0..3, group 1 counters
++         * 4..11). amu_start holds the matching virtual source reading at
++         * that fold, so a read adds the delta only while the counter is
++         * enabled. amu_typer1 holds the guest-written auxiliary event
++         * numbers, which this model does not interpret.
++         */
++        uint64_t amuserenr_el0;
++        uint32_t amcntenset0_el0;
++        uint32_t amcntenset1_el0;
++        uint64_t amu_cnt[12];
++        uint64_t amu_start[12];
++        uint64_t amu_typer1[8];
+     } cp15;
+ 
+     struct {
+
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -5441,11 +5441,13 @@
+ };
+ 
+ /*
+- * Opt-in identification words for the selected Qualcomm APSS profile. The
+- * firmware compares these words with fixed values. No activity monitor, no
+- * trace unit, and no trace output exists behind them. The trace words sit in
+- * the S2_ space, where opc1 selects the minimum exception level, so the access
+- * right stays inside the PL1_RW mask that define_one_arm_cp_reg requires.
++ * Opt-in trace identification words for the selected Qualcomm APSS profile.
++ * The firmware compares these words with fixed values. No trace unit and no
++ * trace output exists behind them. The trace words sit in the S2_ space,
++ * where opc1 selects the minimum exception level, so the access right stays
++ * inside the PL1_RW mask that define_one_arm_cp_reg requires. AMCFGR_EL0 and
++ * AMCGCR_EL0 moved to qcom_amu_reginfo, below, with the rest of the AMUv1
++ * profile.
+  */
+ static uint64_t qcom_trcstatr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+ {
+@@ -5455,12 +5457,6 @@
+ }
+ 
+ static const ARMCPRegInfo qcom_ids_reginfo[] = {
+-    { .name = "AMCFGR_EL0", .state = ARM_CP_STATE_AA64,
+-      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 1,
+-      .access = PL0_R, .type = ARM_CP_CONST, .resetvalue = 0xb },
+-    { .name = "AMCGCR_EL0", .state = ARM_CP_STATE_AA64,
+-      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 2,
+-      .access = PL0_R, .type = ARM_CP_CONST, .resetvalue = 0x804 },
+     { .name = "TRCIDR2", .state = ARM_CP_STATE_AA64,
+       .opc0 = 2, .opc1 = 1, .crn = 0, .crm = 10, .opc2 = 7,
+       .access = PL1_R, .type = ARM_CP_CONST, .resetvalue = 0x1080 },
+@@ -5494,6 +5490,324 @@
+       .fieldoffset = offsetof(CPUARMState, cp15.trfcr_el2) },
+ };
+ 
++/*
++ * Opt-in AMUv1 activity monitors under the Qualcomm identification profile.
++ * AMCFGR_EL0.N reports 0xb and AMCGCR_EL0 reports 0x804, the words the
++ * selected QHEE compares; see docs/qcom/sm88xx/decisions.md for that constant choice.
++ * AMCFGR_EL0.HDBG is clear, so AMCR_EL0 has no writable field and this
++ * model reports it as constant zero.
++ *
++ * Group 0 counter 0 (CPU_CYCLES) and counter 1 (CNT_CYCLES) count from the
++ * same QEMU_CLOCK_VIRTUAL timeline that clocks the generic timer. Counter 0
++ * uses a declared virtual core frequency, the same 1 GHz constant that
++ * clocks the PMU cycle counter in this build. Counter 1 uses the generic
++ * timer counter value, so it runs at CNTFRQ_EL0 like CNTVCT_EL0. Counter 2
++ * (INST_RETIRED) counts instructions only with precise icount. Without
++ * precise icount, it has no source and retains the last guest write.
++ * Counter 3 (STALL_BACKEND_MEM) and every group 1 counter also have no
++ * modeled source. The clock-based counters continue during vCPU idle.
++ * Genuine AMUv1 silicon stops counting in WFI and WFE.
++ * docs/qcom/sm88xx/stubs.md records these source limits.
++ */
++#define QCOM_AMU_CORE_HZ UINT64_C(1000000000)
++
++static uint64_t qcom_amu_core_cycles(CPUARMState *env)
++{
++    return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
++                    QCOM_AMU_CORE_HZ, NANOSECONDS_PER_SECOND);
++}
++
++/* Returns the monotonic virtual source for a counter, or sets has_source to
++ * false for a counter this model does not clock (read-modify-write only). */
++static uint64_t qcom_amu_source(CPUARMState *env, unsigned index, bool *has_source)
++{
++    *has_source = true;
++    switch (index) {
++    case 0:
++        return qcom_amu_core_cycles(env);
++    case 1:
++        return gt_get_countervalue(env);
++    case 2:
++        if (icount_enabled() == ICOUNT_PRECISE) {
++            return (uint64_t)icount_get_raw();
++        }
++        *has_source = false;
++        return 0;
++    default:
++        *has_source = false;
++        return 0;
++    }
++}
++
++static bool qcom_amu_enabled(CPUARMState *env, unsigned index)
++{
++    if (index < 4) {
++        return (env->cp15.amcntenset0_el0 >> index) & 1;
++    }
++    return (env->cp15.amcntenset1_el0 >> (index - 4)) & 1;
++}
++
++/* Fold the delta since the last start into the accumulated raw value. */
++static void qcom_amu_fold(CPUARMState *env, unsigned index)
++{
++    bool has_source;
++    uint64_t now = qcom_amu_source(env, index, &has_source);
++
++    if (has_source && qcom_amu_enabled(env, index)) {
++        env->cp15.amu_cnt[index] += now - env->cp15.amu_start[index];
++        env->cp15.amu_start[index] = now;
++    }
++}
++
++static void qcom_amu_cntenset_write(CPUARMState *env, unsigned group, uint32_t value)
++{
++    unsigned base = group ? 4 : 0;
++    unsigned count = group ? 8 : 4;
++    uint32_t *enable = group ? &env->cp15.amcntenset1_el0 : &env->cp15.amcntenset0_el0;
++    unsigned i;
++
++    for (i = 0; i < count; i++) {
++        if (((value >> i) & 1) && !((*enable >> i) & 1)) {
++            bool has_source;
++            env->cp15.amu_start[base + i] = qcom_amu_source(env, base + i, &has_source);
++        }
++    }
++    *enable |= value & MAKE_64BIT_MASK(0, count);
++}
++
++static void qcom_amu_cntenclr_write(CPUARMState *env, unsigned group, uint32_t value)
++{
++    unsigned base = group ? 4 : 0;
++    unsigned count = group ? 8 : 4;
++    uint32_t *enable = group ? &env->cp15.amcntenset1_el0 : &env->cp15.amcntenset0_el0;
++    unsigned i;
++
++    for (i = 0; i < count; i++) {
++        if (((value >> i) & 1) && ((*enable >> i) & 1)) {
++            qcom_amu_fold(env, base + i);
++        }
++    }
++    *enable &= ~(value & MAKE_64BIT_MASK(0, count));
++}
++
++static CPAccessResult access_qcom_amu(CPUARMState *env, const ARMCPRegInfo *ri,
++                                      bool isread)
++{
++    int el = arm_current_el(env);
++    bool el2 = arm_is_el2_enabled(env);
++
++    if (!isread && el != arm_highest_el(env)) {
++        return CP_ACCESS_UNDEFINED;
++    }
++    if (el == 0 && !(env->cp15.amuserenr_el0 & 1)) {
++        if (el2 && (arm_hcr_el2_eff(env) & HCR_TGE)) {
++            return CP_ACCESS_TRAP_EL2;
++        }
++        return CP_ACCESS_TRAP_EL1;
++    }
++    if (el < 2 && el2 && FIELD_EX64(env->cp15.cptr_el[2], CPTR_EL2, TAM)) {
++        return CP_ACCESS_TRAP_EL2;
++    }
++    if (el < 3 && arm_feature(env, ARM_FEATURE_EL3) &&
++        FIELD_EX64(env->cp15.cptr_el[3], CPTR_EL3, TAM)) {
++        return CP_ACCESS_TRAP_EL3;
++    }
++    return CP_ACCESS_OK;
++}
++
++/* AMUSERENR_EL0 carries no EN gate on itself, only the TAM traps. */
++static CPAccessResult access_qcom_amuserenr(CPUARMState *env,
++                                            const ARMCPRegInfo *ri, bool isread)
++{
++    int el = arm_current_el(env);
++
++    if (el < 2 && arm_is_el2_enabled(env) &&
++        FIELD_EX64(env->cp15.cptr_el[2], CPTR_EL2, TAM)) {
++        return CP_ACCESS_TRAP_EL2;
++    }
++    if (el < 3 && arm_feature(env, ARM_FEATURE_EL3) &&
++        FIELD_EX64(env->cp15.cptr_el[3], CPTR_EL3, TAM)) {
++        return CP_ACCESS_TRAP_EL3;
++    }
++    return CP_ACCESS_OK;
++}
++
++/* AMEVCNTR0<m> uses CRm 4 with m in opc2. AMEVCNTR1<m> uses CRm 12 with m
++ * in opc2, offset into the shared state array by the four group 0 slots. */
++static unsigned qcom_amevcntr_index(const ARMCPRegInfo *ri)
++{
++    return (ri->crm == 12 ? 4 : 0) + (ri->opc2 & 7);
++}
++
++static uint64_t qcom_amevcntr_read(CPUARMState *env, const ARMCPRegInfo *ri)
++{
++    unsigned index = qcom_amevcntr_index(ri);
++    uint64_t value = env->cp15.amu_cnt[index];
++
++    if (qcom_amu_enabled(env, index)) {
++        bool has_source;
++        uint64_t now = qcom_amu_source(env, index, &has_source);
++
++        if (has_source) {
++            value += now - env->cp15.amu_start[index];
++        }
++    }
++    return value;
++}
++
++static void qcom_amevcntr_write(CPUARMState *env, const ARMCPRegInfo *ri,
++                                uint64_t value)
++{
++    unsigned index = qcom_amevcntr_index(ri);
++    bool has_source;
++
++    env->cp15.amu_cnt[index] = value;
++    env->cp15.amu_start[index] = qcom_amu_source(env, index, &has_source);
++}
++
++static uint64_t qcom_amcntenset0_read(CPUARMState *env, const ARMCPRegInfo *ri)
++{
++    return env->cp15.amcntenset0_el0;
++}
++
++static void qcom_amcntenset0_write(CPUARMState *env, const ARMCPRegInfo *ri,
++                                   uint64_t value)
++{
++    qcom_amu_cntenset_write(env, 0, (uint32_t)value & 0xf);
++}
++
++static void qcom_amcntenclr0_write(CPUARMState *env, const ARMCPRegInfo *ri,
++                                   uint64_t value)
++{
++    qcom_amu_cntenclr_write(env, 0, (uint32_t)value & 0xf);
++}
++
++static uint64_t qcom_amcntenset1_read(CPUARMState *env, const ARMCPRegInfo *ri)
++{
++    return env->cp15.amcntenset1_el0;
++}
++
++static void qcom_amcntenset1_write(CPUARMState *env, const ARMCPRegInfo *ri,
++                                   uint64_t value)
++{
++    qcom_amu_cntenset_write(env, 1, (uint32_t)value & 0xff);
++}
++
++static void qcom_amcntenclr1_write(CPUARMState *env, const ARMCPRegInfo *ri,
++                                   uint64_t value)
++{
++    qcom_amu_cntenclr_write(env, 1, (uint32_t)value & 0xff);
++}
++
++static void qcom_amu_reset(CPUARMState *env, const ARMCPRegInfo *ri)
++{
++    memset(env->cp15.amu_cnt, 0, sizeof(env->cp15.amu_cnt));
++    memset(env->cp15.amu_start, 0, sizeof(env->cp15.amu_start));
++    memset(env->cp15.amu_typer1, 0, sizeof(env->cp15.amu_typer1));
++    env->cp15.amuserenr_el0 = 0;
++    env->cp15.amcntenset0_el0 = 0;
++    env->cp15.amcntenset1_el0 = 0;
++}
++
++static const ARMCPRegInfo qcom_amu_id_reginfo[] = {
++    { .name = "AMCFGR_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 1,
++      .access = PL0_R, .accessfn = access_qcom_amu,
++      .type = ARM_CP_CONST, .resetvalue = 0xb },
++    { .name = "AMCGCR_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 2,
++      .access = PL0_R, .accessfn = access_qcom_amu,
++      .type = ARM_CP_CONST, .resetvalue = 0x804 },
++};
++
++static const ARMCPRegInfo qcom_amu_reginfo[] = {
++    { .name = "AMCR_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 0,
++      .access = PL0_RW, .accessfn = access_qcom_amu,
++      .type = ARM_CP_CONST, .resetvalue = 0 },
++    { .name = "AMUSERENR_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 3,
++      .access = PL0_R | PL1_W, .accessfn = access_qcom_amuserenr,
++      .resetfn = qcom_amu_reset,
++      .fieldoffset = offsetof(CPUARMState, cp15.amuserenr_el0) },
++    { .name = "AMCNTENSET0_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 5,
++      .access = PL0_RW, .accessfn = access_qcom_amu, .type = ARM_CP_NO_RAW,
++      .readfn = qcom_amcntenset0_read, .writefn = qcom_amcntenset0_write },
++    { .name = "AMCNTENCLR0_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 2, .opc2 = 4,
++      .access = PL0_RW, .accessfn = access_qcom_amu, .type = ARM_CP_NO_RAW,
++      .readfn = qcom_amcntenset0_read, .writefn = qcom_amcntenclr0_write },
++    { .name = "AMCNTENSET1_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 3, .opc2 = 1,
++      .access = PL0_RW, .accessfn = access_qcom_amu, .type = ARM_CP_NO_RAW,
++      .readfn = qcom_amcntenset1_read, .writefn = qcom_amcntenset1_write },
++    { .name = "AMCNTENCLR1_EL0", .state = ARM_CP_STATE_AA64,
++      .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 3, .opc2 = 0,
++      .access = PL0_RW, .accessfn = access_qcom_amu, .type = ARM_CP_NO_RAW,
++      .readfn = qcom_amcntenset1_read, .writefn = qcom_amcntenclr1_write },
++};
++
++/* AMEVCNTR0<n>_EL0 and AMEVTYPER0<n>_EL0, n = 0..3: four architected event
++ * counters with the fixed events the selected QHEE and Linux amu_* code
++ * expect. AMEVTYPER0<n>_EL0 is read-only, matching the architected choice
++ * that every group 0 event is fixed at implementation. */
++static void define_qcom_amevcntr0(ARMCPU *cpu, unsigned n, uint32_t event)
++{
++    ARMCPRegInfo cntr = {
++        .state = ARM_CP_STATE_AA64,
++        .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 4, .opc2 = n,
++        .access = PL0_RW, .accessfn = access_qcom_amu,
++        .fieldoffset = offsetof(CPUARMState, cp15.amu_cnt[0]) + n * sizeof(uint64_t),
++        .readfn = qcom_amevcntr_read, .writefn = qcom_amevcntr_write,
++        .raw_readfn = raw_read, .raw_writefn = raw_write,
++    };
++    ARMCPRegInfo typer = {
++        .state = ARM_CP_STATE_AA64,
++        .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 6, .opc2 = n,
++        .access = PL0_R, .accessfn = access_qcom_amu,
++        .type = ARM_CP_CONST, .resetvalue = event,
++    };
++
++    g_autofree char *cntr_name = g_strdup_printf("AMEVCNTR0%u_EL0", n);
++    g_autofree char *typer_name = g_strdup_printf("AMEVTYPER0%u_EL0", n);
++
++    cntr.name = cntr_name;
++    typer.name = typer_name;
++    define_one_arm_cp_reg(cpu, &cntr);
++    define_one_arm_cp_reg(cpu, &typer);
++}
++
++/* AMEVCNTR1<n>_EL0 and AMEVTYPER1<n>_EL0, n = 0..7: eight auxiliary
++ * counters with no modeled event source. Both halves retain guest writes,
++ * so Linux's amu_* probing sees RW registers with no advancing count. */
++static void define_qcom_amevcntr1(ARMCPU *cpu, unsigned n)
++{
++    ARMCPRegInfo cntr = {
++        .state = ARM_CP_STATE_AA64,
++        .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 12, .opc2 = n,
++        .access = PL0_RW, .accessfn = access_qcom_amu,
++        .fieldoffset = offsetof(CPUARMState, cp15.amu_cnt[4]) + n * sizeof(uint64_t),
++        .readfn = qcom_amevcntr_read, .writefn = qcom_amevcntr_write,
++        .raw_readfn = raw_read, .raw_writefn = raw_write,
++    };
++    ARMCPRegInfo typer = {
++        .state = ARM_CP_STATE_AA64,
++        .opc0 = 3, .opc1 = 3, .crn = 13, .crm = 14, .opc2 = n,
++        .access = PL0_RW, .accessfn = access_qcom_amu,
++        .fieldoffset = offsetof(CPUARMState, cp15.amu_typer1[0]) + n * sizeof(uint64_t),
++        .raw_readfn = raw_read, .raw_writefn = raw_write,
++    };
++
++    g_autofree char *cntr_name = g_strdup_printf("AMEVCNTR1%u_EL0", n);
++    g_autofree char *typer_name = g_strdup_printf("AMEVTYPER1%u_EL0", n);
++
++    cntr.name = cntr_name;
++    typer.name = typer_name;
++    define_one_arm_cp_reg(cpu, &cntr);
++    define_one_arm_cp_reg(cpu, &typer);
++}
++
+ static CPAccessResult access_pauth(CPUARMState *env, const ARMCPRegInfo *ri,
+                                    bool isread)
+ {
+@@ -7748,7 +8062,18 @@
+         }
+     }
+     if (cpu->qcom_ids) {
++        unsigned qcom_amu_n;
++
+         define_arm_cp_regs(cpu, qcom_ids_reginfo);
++        define_arm_cp_regs(cpu, qcom_amu_id_reginfo);
++        define_arm_cp_regs(cpu, qcom_amu_reginfo);
++        define_qcom_amevcntr0(cpu, 0, 0x11);
++        define_qcom_amevcntr0(cpu, 1, 0x4004);
++        define_qcom_amevcntr0(cpu, 2, 0x8);
++        define_qcom_amevcntr0(cpu, 3, 0x4005);
++        for (qcom_amu_n = 0; qcom_amu_n < 8; qcom_amu_n++) {
++            define_qcom_amevcntr1(cpu, qcom_amu_n);
++        }
+     }
+     if (cpu_isar_feature(aa64_pauth, cpu)) {
+         define_arm_cp_regs(cpu, pauth_reginfo);

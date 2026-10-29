@@ -1,0 +1,16 @@
+/build/
+/disks/
+/target/
+/refs/
+/firmware/**
+!/firmware/**/
+!/firmware/qcom/sm88xx/oplus/example.toml
+!/firmware/qcom/sm88xx/tme-runtime/tme-runtime-adapter.S
+!/firmware/qcom/sm88xx/tme-runtime/tme-runtime-api.map
+!/firmware/qcom/sm88xx/tme-runtime/tme-runtime-relocations.json
+/firmware.toml
+*.bin
+*.elf
+*.mbn
+*.melf
+*.img

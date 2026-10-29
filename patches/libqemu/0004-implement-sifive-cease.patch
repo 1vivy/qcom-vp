@@ -1,0 +1,99 @@
+diff --git a/target/riscv/cpu_cfg_fields.h.inc b/target/riscv/cpu_cfg_fields.h.inc
+--- a/target/riscv/cpu_cfg_fields.h.inc
++++ b/target/riscv/cpu_cfg_fields.h.inc
+@@ -5,4 +5,5 @@
+  * #define TYPED_FIELD(type, x, default)
+  */
+ 
++BOOL_FIELD(sifive_cease)
+ BOOL_FIELD(ext_zba)
+diff --git a/target/riscv/cpu.h b/target/riscv/cpu.h
+--- a/target/riscv/cpu.h
++++ b/target/riscv/cpu.h
+@@ -265,3 +265,4 @@
+     uint64_t pc;
++    bool ceased;
+     uint64_t load_res;
+     uint64_t load_val;
+diff --git a/target/riscv/cpu.c b/target/riscv/cpu.c
+--- a/target/riscv/cpu.c
++++ b/target/riscv/cpu.c
+@@ -741,5 +741,9 @@
+ bool riscv_cpu_has_work(CPUState *cs)
+ {
+     RISCVCPU *cpu = RISCV_CPU(cs);
+     CPURISCVState *env = &cpu->env;
++    /* CEASE ignores interrupts. Only reset clears this state. */
++    if (env->ceased) {
++        return false;
++    }
+     /*
+@@ -801,4 +805,5 @@
+     env->mcause = 0;
+     env->miclaim = MIP_SGEIP;
+     env->pc = env->resetvec;
++    env->ceased = false;
+     env->bins = 0;
+@@ -2665,3 +2670,6 @@
+     DEFINE_PROP_BOOL("debug", RISCVCPU, cfg.debug, true),
+     DEFINE_PROP_BOOL("big-endian", RISCVCPU, cfg.big_endian, false),
++#ifndef CONFIG_USER_ONLY
++    DEFINE_PROP_BOOL("x-sifive-cease", RISCVCPU, cfg.sifive_cease, false),
++#endif
+ 
+diff --git a/target/riscv/insn32.decode b/target/riscv/insn32.decode
+--- a/target/riscv/insn32.decode
++++ b/target/riscv/insn32.decode
+@@ -120,3 +120,4 @@
+ mret        0011000    00010 00000 000 00000 1110011
+ wfi         0001000    00101 00000 000 00000 1110011
++cease       0011000    00101 00000 000 00000 1110011
+ sfence_vma  0001001    ..... ..... 000 00000 1110011 @sfence_vma
+diff --git a/target/riscv/helper.h b/target/riscv/helper.h
+--- a/target/riscv/helper.h
++++ b/target/riscv/helper.h
+@@ -138,3 +138,4 @@
+ DEF_HELPER_1(ctr_clear, void, env)
+ DEF_HELPER_1(wfi, void, env)
++DEF_HELPER_1(cease, noreturn, env)
+ DEF_HELPER_1(wrs_nto, void, env)
+diff --git a/target/riscv/op_helper.c b/target/riscv/op_helper.c
+--- a/target/riscv/op_helper.c
++++ b/target/riscv/op_helper.c
+@@ -544,2 +544,14 @@
++void helper_cease(CPURISCVState *env)
++{
++    CPUState *cs = env_cpu(env);
++    if (env->priv != PRV_M) {
++        riscv_raise_exception(env, RISCV_EXCP_ILLEGAL_INST, GETPC());
++    }
++    env->ceased = true;
++    cs->halted = 1;
++    cs->exception_index = EXCP_HLT;
++    cpu_loop_exit(cs);
++}
++
+ void helper_wfi(CPURISCVState *env)
+ {
+diff --git a/target/riscv/insn_trans/trans_privileged.c.inc b/target/riscv/insn_trans/trans_privileged.c.inc
+--- a/target/riscv/insn_trans/trans_privileged.c.inc
++++ b/target/riscv/insn_trans/trans_privileged.c.inc
+@@ -142,2 +142,18 @@
++static bool trans_cease(DisasContext *ctx, arg_cease *a)
++{
++#ifndef CONFIG_USER_ONLY
++    if (!ctx->cfg_ptr->sifive_cease) {
++        return false;
++    }
++    decode_save_opc(ctx, 0);
++    gen_update_pc(ctx, 0);
++    gen_helper_cease(tcg_env);
++    ctx->base.is_jmp = DISAS_NORETURN;
++    return true;
++#else
++    return false;
++#endif
++}
++
+ static bool trans_wfi(DisasContext *ctx, arg_wfi *a)
+ {

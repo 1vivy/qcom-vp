@@ -1,0 +1,31 @@
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -1648,6 +1648,7 @@
+ typedef struct MMULookupLocals {
+     MMULookupPageData page[2];
++    CPUTLBEntryFull full_snapshot[2];
+     MemOp memop;
+     int mmu_idx;
+ } MMULookupLocals;
+ 
+@@ -1817,5 +1818,18 @@
+         tcg_debug_assert((flags & TLB_BSWAP) == 0);
+     }
+ 
++    /*
++     * MMIO callbacks can flush and resize the TLB. Preserve both page
++     * translations before the first callback of a split access.
++     */
++    if (unlikely(flags & TLB_MMIO)) {
++        l->full_snapshot[0] = *l->page[0].full;
++        l->page[0].full = &l->full_snapshot[0];
++        if (crosspage) {
++            l->full_snapshot[1] = *l->page[1].full;
++            l->page[1].full = &l->full_snapshot[1];
++        }
++    }
++
+     return crosspage;
+ }
+ 

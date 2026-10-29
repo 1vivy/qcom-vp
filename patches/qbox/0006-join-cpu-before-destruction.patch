@@ -1,0 +1,99 @@
+diff --git a/qemu-components/common/include/cpu.h b/qemu-components/common/include/cpu.h
+--- a/qemu-components/common/include/cpu.h
++++ b/qemu-components/common/include/cpu.h
+@@ -64,7 +64,6 @@
+     virtual void on_before_end_of_elaboration() {}
+     virtual void on_end_of_elaboration() {}
+     virtual void on_end_of_simulation() {}
+-    virtual void on_destroy() {}
+ 
+     /* halt_cb: pre runs before the QEMU halt, post after it. */
+     virtual void on_halt_pre(bool val) {}
+@@ -107,7 +106,6 @@
+         void on_before_end_of_elaboration() override;
+         void on_end_of_simulation() override;
+-        void on_destroy() override;
+         void on_halt_pre(bool val) override;
+         void on_halt_post() override;
+         void on_reset_finish() override;
+         void on_kick_notify() override;
+@@ -130,5 +128,4 @@
+         using CpuTimeSyncStrategy::CpuTimeSyncStrategy;
+ 
+         void on_end_of_elaboration() override;
+-        void on_destroy() override;
+     };
+@@ -169,5 +166,4 @@
+     gs::async_event m_start_reset_done_ev;
+ 
+-    std::mutex m_can_delete;
+     QemuCpuHintTlmExtension m_cpu_hint_ext;
+     cci::cci_param<uint64_t> m_insn_per_second;
+@@ -514,7 +510,6 @@
+         if (m_coroutines) {
+             m_inst.get().coroutine_yield();
+         } else {
+-            std::lock_guard<std::mutex> lock(m_can_delete);
+             sync_with_kernel();
+             prepare_run_cpu();
+         }
+@@ -594,7 +589,16 @@
+             }
+         }
+ 
+-        m_time_sync->on_destroy();
++        // Cancel SystemC work before joining. The kernel cannot service it now.
++        m_on_sysc.end_of_simulation();
++        socket.end_of_simulation();
++        // Halt and unplug are asynchronous. Join before any CPU members are freed.
++        if (m_started && m_realized && !m_coroutines && m_cpu.valid()) {
++            m_inst.get().lock_iothread();
++            m_cpu.remove_sync();
++            m_inst.get().unlock_iothread();
++        }
++
+         m_inst.del_dev(this);
+     }
+ 
+@@ -895,10 +899,3 @@
+-inline void QemuCpu::QuantumKeeperSync::on_destroy()
+-{
+-    while (!m_qemu_cpu.m_can_delete.try_lock()) {
+-        m_qemu_cpu.m_qk->stop();
+-    }
+-}
+-
+ inline void QemuCpu::QuantumKeeperSync::on_halt_pre(bool val)
+ {
+     if (val) {
+@@ -976,20 +973,1 @@
+-inline void QemuCpu::McipsSync::on_destroy()
+-{
+-    /*
+-     * In MCIPS mode the vCPU is a free-running MTTCG thread with no QK/deadline
+-     * timer gating it to SystemC. end_of_simulation() only requests halt+unplug
+-     * asynchronously, so after sc_stop() the thread can still be in tcg_cpu_exec()
+-     * and touch the QemuInstance after it is freed -> use-after-free. By now the
+-     * simulation has stopped and runonsysc jobs are cancelled, so it is safe to
+-     * synchronously join the vCPU thread before the QemuInstance is destroyed.
+-     */
+-    if (!m_qemu_cpu.m_started || m_qemu_cpu.m_coroutines || !m_qemu_cpu.m_cpu.valid()) {
+-        return;
+-    }
+-
+-    m_qemu_cpu.m_inst.get().lock_iothread();
+-    m_qemu_cpu.m_cpu.remove_sync(); // stop + unplug + join the vCPU thread
+-    m_qemu_cpu.m_inst.get().unlock_iothread();
+-}
+-
+ #endif
+diff --git a/qemu-components/common/include/ports/initiator.h b/qemu-components/common/include/ports/initiator.h
+--- a/qemu-components/common/include/ports/initiator.h
++++ b/qemu-components/common/include/ports/initiator.h
+@@ -684,5 +684,6 @@
+     void end_of_simulation()
+     {
+         m_finished = true;
++        m_on_sysc.end_of_simulation();
+     }
+ 

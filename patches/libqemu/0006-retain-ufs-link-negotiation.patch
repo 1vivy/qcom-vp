@@ -1,0 +1,298 @@
+--- a/hw/ufs/ufs.c
++++ b/hw/ufs/ufs.c
+@@ -393,7 +393,18 @@
+- * Return canned PA layer attribute values. The emulated link has no PHY,
+- * so these are purely declarative: a single lane in HS-Gear 4, FAST_MODE.
++ * The virtual link has one lane and supports gears 1 through 4.
++ * Negotiation attributes retain guest configuration without analog training.
+  */
++static bool ufs_uic_peer_available(UfsHc *u)
++{
++    return !u->device_reset_asserted && FIELD_EX32(u->reg.hcs, HCS, DP);
++}
++
+-static bool ufs_uic_dme_get_value(UfsHc *u, uint16_t attr_id, uint32_t *value)
++static bool ufs_uic_dme_get_value(UfsHc *u, uint16_t attr_id, bool peer,
++                                  uint32_t *value)
+ {
++    if (peer && !ufs_uic_peer_available(u)) {
++        return false;
++    }
+     switch (attr_id) {
++    case 0x1560: /* PA_ActiveTxDataLanes */
++    case 0x1580: /* PA_ActiveRxDataLanes */
+     case UFS_ATTR_PA_AVAILTXDATALANES:
+@@ -407,14 +418,174 @@
+         *value = 4;
+         return true;
+     case UFS_ATTR_PA_PWRMODE:
+-        *value = (1 << 4) | 1;
++        *value = u->pa_power_mode;
+-        return true;
++        return !peer;
++    case 0x15a0: /* Local cache, populated by a completed link startup. */
++        *value = u->peer_unipro_version;
++        return !peer;
+     case 0x15a9: /* PA_LocalVerInfo: virtual UniPro 1.6. */
+         *value = 3;
+         return true;
++    case 0xd002: /* Qualcomm DME_VS_CORE_CLK_CTRL request word. */
++        *value = u->qcom_core_clock_control;
++        return !peer;
++    case 0x9007: /* Qualcomm PA_VS_CORE_CLK_40NS_CYCLES request word. */
++        *value = u->qcom_core_clock_40ns;
++        return !peer;
++    case 0x0002: /* Peer TX_HSGEAR capability uses the declared maximum. */
++        *value = 4;
++        return peer;
++    case 0x0023: /* Peer TX_HSGEAR is the connected local RX gear. */
++        *value = u->pa_rx_gear;
++        return peer;
++    case 0x0041: /* Expose only the modeled TX HIBERN8 state. */
++        if (peer || !FIELD_EX32(u->reg.hce, HCE, HCE) ||
++            (FIELD_EX32(u->reg.hcs, HCS, DP) && !u->pa_hibernating)) {
++            return false;
++        }
++        *value = 1;
++        return true;
++    case 0x009f: /* Declared ideal peer G4 adaptation initial value. */
++        *value = 0;
++        return peer;
++    case 0x15aa: /* Explicit virtual granularity: one microsecond. */
++        *value = 1;
++        return true;
++    case 0x15a8:
++        *value = peer ? u->peer_tactivate : u->pa_tactivate;
++        return true;
++    case 0x15a7: *value = u->pa_hibern8time; return !peer;
++    case 0x15d3: *value = u->pa_adapt_initial; return !peer;
++    case 0x15d4: *value = u->pa_adapt_type; return !peer;
++    case 0x155e: *value = u->pa_local_tx_lcc; return !peer;
++    case 0x155f: *value = u->pa_peer_tx_lcc; return !peer;
++    case 0x1568: *value = u->pa_tx_gear; return !peer;
++    case 0x1583: *value = u->pa_rx_gear; return !peer;
++    case 0x1569: *value = u->pa_tx_termination; return !peer;
++    case 0x1584: *value = u->pa_rx_termination; return !peer;
++    case 0x156a: *value = u->pa_hs_series; return !peer;
++    case 0x15b0: case 0x15b1: case 0x15b2:
++    case 0x15b3: case 0x15b4: case 0x15b5:
++        *value = u->pa_power_user_data[attr_id - 0x15b0];
++        return !peer;
+     case 0x15a4: /* PA_SaveConfigTime */
+         *value = u->pa_save_config_time;
+         return true;
++    default:
++        return false;
++    }
++}
++
++static bool ufs_uic_dme_set_value(UfsHc *u, uint16_t attr, uint32_t value,
++                                  bool peer)
++{
++    if (peer) {
++        if (attr != 0x15a8 || !ufs_uic_peer_available(u) ||
++            !value || value > UINT16_MAX) {
++            return false;
++        }
++        u->peer_tactivate = value;
++        return true;
++    }
++    switch (attr) {
++    case 0xd002:
++        u->qcom_core_clock_control = value;
++        return true;
++    case 0x9007:
++        u->qcom_core_clock_40ns = value;
++        return true;
++    case 0x0037:
++        if (value > UINT8_MAX) {
++            return false;
++        }
++        u->pa_tx_equalizer = value;
++        return true;
++    case 0x15a8:
++        if (!value || value > UINT16_MAX) {
++            return false;
++        }
++        u->pa_tactivate = value;
++        return true;
++    case 0x15a7:
++        if (value > UINT16_MAX) {
++            return false;
++        }
++        u->pa_hibern8time = value;
++        return true;
++    case 0x15d3:
++        if (value > UINT8_MAX) {
++            return false;
++        }
++        u->pa_adapt_initial = value;
++        return true;
++    case 0x15d4:
++        if (value > 3 || value == 2) {
++            return false;
++        }
++        u->pa_adapt_type = value;
++        return true;
++    case 0x155e: case 0x155f:
++        if (value > 1) {
++            return false;
++        }
++        if (attr == 0x155e) {
++            u->pa_local_tx_lcc = value;
++        } else {
++            u->pa_peer_tx_lcc = value;
++        }
++        return true;
++    case 0x1560: /* PA_ActiveTxDataLanes */
++    case 0x1580: /* PA_ActiveRxDataLanes */
++    case UFS_ATTR_PA_AVAILTXDATALANES:
++    case UFS_ATTR_PA_AVAILRXDATALANES:
++        /* The declared topology has one lane in each direction. */
++        return value == 1;
++    case 0x15a4:
++        u->pa_save_config_time = value;
++        return true;
++    case 0x1568: case 0x1583:
++        if (value < 1 || value > 4) {
++            return false;
++        }
++        if (attr == 0x1568) {
++            u->pa_tx_gear = value;
++        } else {
++            u->pa_rx_gear = value;
++        }
++        return true;
++    case 0x1569: case 0x1584:
++        if (value > 1) {
++            return false;
++        }
++        if (attr == 0x1569) {
++            u->pa_tx_termination = value;
++        } else {
++            u->pa_rx_termination = value;
++        }
++        return true;
++    case 0x156a:
++        if (value != 1 && value != 2) {
++            return false;
++        }
++        u->pa_hs_series = value;
++        return true;
++    case 0x15b0: case 0x15b1: case 0x15b2:
++    case 0x15b3: case 0x15b4: case 0x15b5:
++        if (value > UINT16_MAX) {
++            return false;
++        }
++        u->pa_power_user_data[attr - 0x15b0] = value;
++        return true;
++    case UFS_ATTR_PA_PWRMODE: {
++        unsigned tx = value >> 4;
++        unsigned rx = value & 15;
++        if ((tx != 1 && tx != 2 && tx != 4 && tx != 5) ||
++            (rx != 1 && rx != 2 && rx != 4 && rx != 5)) {
++            return false;
++        }
++        u->pa_power_mode = value;
++        return true;
++    }
+     default:
+         return false;
+     }
+@@ -440,6 +611,8 @@
+             break;
+         }
++        u->pa_hibernating = false;
++        u->peer_unipro_version = 3; /* The declared peer uses UniPro 1.6. */
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, DP, 1);
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTRLRDY, 1);
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTMRLRDY, 1);
+         u->reg.ucmdarg2 = UFS_UIC_CMD_RESULT_SUCCESS;
+@@ -447,7 +620,10 @@
+         attr_id = (u->reg.ucmdarg1 >> 16) & 0xFFFF;
+-        u->reg.ucmdarg2 = (u->reg.ucmdarg1 & 0xffff) ||
++        u->reg.ucmdarg2 = ((u->reg.ucmdarg1 & 0xffff) &&
++            !(val == UFS_UIC_CMD_DME_PEER_GET &&
++              u->reg.ucmdarg1 == 0x009f0004)) ||
+             (val == UFS_UIC_CMD_DME_PEER_GET && u->device_reset_asserted) ||
+-            !ufs_uic_dme_get_value(u, attr_id, &value) ?
++            !ufs_uic_dme_get_value(u, attr_id,
++                val == UFS_UIC_CMD_DME_PEER_GET, &value) ?
+             UFS_UIC_CMD_RESULT_FAILURE : UFS_UIC_CMD_RESULT_SUCCESS;
+         if (u->reg.ucmdarg2 == UFS_UIC_CMD_RESULT_SUCCESS) {
+             u->reg.ucmdarg3 = value;
+@@ -458,20 +634,10 @@
+     case UFS_UIC_CMD_DME_PEER_SET:
+         attr_id = (u->reg.ucmdarg1 >> 16) & 0xFFFF;
+-        if (val != UFS_UIC_CMD_DME_SET || (u->reg.ucmdarg1 & 0xffff) ||
++        if ((u->reg.ucmdarg1 & 0xffff) ||
+-            (attr_id != UFS_ATTR_PA_PWRMODE && attr_id != 0x15a4 &&
+-             attr_id != UFS_ATTR_PA_AVAILTXDATALANES &&
+-             attr_id != UFS_ATTR_PA_AVAILRXDATALANES)) {
++            !ufs_uic_dme_set_value(u, attr_id, u->reg.ucmdarg3,
++                val == UFS_UIC_CMD_DME_PEER_SET)) {
+             u->reg.ucmdarg2 = UFS_UIC_CMD_RESULT_FAILURE;
+             break;
+-        }
+-        /* The virtual topology has exactly one available lane per direction. */
+-        if ((attr_id == UFS_ATTR_PA_AVAILTXDATALANES ||
+-             attr_id == UFS_ATTR_PA_AVAILRXDATALANES) && u->reg.ucmdarg3 != 1) {
+-            u->reg.ucmdarg2 = UFS_UIC_CMD_RESULT_FAILURE;
+-            break;
+-        }
+-        if (attr_id == 0x15a4) {
+-            u->pa_save_config_time = u->reg.ucmdarg3;
+         }
+         u->reg.ucmdarg2 = UFS_UIC_CMD_RESULT_SUCCESS;
+         /* DME_SET(PA_PWRMODE) is a power-mode-change trigger. */
+@@ -489,9 +655,11 @@
+     case UFS_UIC_CMD_DME_HIBER_ENTER:
++        u->pa_hibernating = true;
+         u->reg.is = FIELD_DP32(u->reg.is, IS, UHES, 1);
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UPMCRS, UFS_PWR_LOCAL);
+         u->reg.ucmdarg2 = UFS_UIC_CMD_RESULT_SUCCESS;
+         break;
+     case UFS_UIC_CMD_DME_HIBER_EXIT:
++        u->pa_hibernating = false;
+         u->reg.is = FIELD_DP32(u->reg.is, IS, UHXS, 1);
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UPMCRS, UFS_PWR_LOCAL);
+         u->reg.ucmdarg2 = UFS_UIC_CMD_RESULT_SUCCESS;
+@@ -2621,6 +2789,7 @@
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTMRLRDY, 0);
+         u->flags.device_init = 0;
++        u->peer_tactivate = 10;
+         for (unsigned i = 0; i < UFS_MAX_LUS; i++) {
+             if (u->lus[i] && u->lus[i]->scsi_dev) {
+                 device_cold_reset(DEVICE(u->lus[i]->scsi_dev));
+             }
+@@ -2814,6 +2983,11 @@
+     u->geometry_desc.supported_write_booster_buffer_types =
+         0x1; /* lu-dedicated buffer type is not supported */
+ 
++    /* Explicit virtual negotiation state, not physical reset measurements. */
++    u->pa_tx_gear = u->pa_rx_gear = u->pa_hs_series = 1;
++    u->pa_power_mode = 0x11;
++    u->pa_tactivate = u->peer_tactivate = 10;
++    u->pa_adapt_type = 3; /* PA_NO_ADAPT */
+     memset(&u->attributes, 0, sizeof(u->attributes));
+     u->attributes.boot_lun_en = u->params.boot_lun_en;
+     u->attributes.max_data_in_size = 0x08;
+--- a/hw/ufs/ufs.h
++++ b/hw/ufs/ufs.h
+@@ -161,6 +161,16 @@
+     UfsMcqOpReg mcq_op_reg[UFS_MAX_MCQ_QNUM];
+     UfsParams params;
+     uint32_t pa_save_config_time;
++    uint8_t pa_tx_gear, pa_rx_gear;
++    uint8_t pa_tx_termination, pa_rx_termination;
++    uint8_t pa_hs_series, pa_power_mode;
++    uint16_t pa_power_user_data[6];
++    uint16_t pa_tactivate, peer_tactivate, pa_hibern8time;
++    uint16_t peer_unipro_version;
++    uint32_t qcom_core_clock_control, qcom_core_clock_40ns;
++    uint8_t pa_adapt_initial, pa_adapt_type;
++    uint8_t pa_local_tx_lcc, pa_peer_tx_lcc, pa_tx_equalizer;
++    bool pa_hibernating;
+     bool device_reset_asserted;
+     uint32_t reg_size;
+     UfsRequest *req_list;

@@ -1,0 +1,151 @@
+From: qcom-vp maintainers
+Subject: [PATCH] system: add bulk memory access callbacks
+
+Device DMA into an emulated region costs one host round trip per beat.
+QEMU splits each access to a non-RAM region into runs of eight bytes or
+less. Each run reaches the SystemC model through the iothread.
+
+Add optional byte-buffer callbacks to MemoryRegionOps. A region that sets
+them accepts one contiguous run of any length inside one memory section.
+The read and write steps of the flat view then call the region once with
+the complete run. They keep the BQL release and the access check. The
+caller advances by the whole run.
+
+A region without the callbacks keeps the current per-beat path. The
+libqemu wrapper exports one setter. A model can thus install the callbacks
+with its own opaque pointer.
+
+This is a host-only extension. It does not change the guest-visible
+behavior of QEMU.
+
+---
+--- a/include/system/memory.h
++++ b/include/system/memory.h
+@@ -313,6 +313,13 @@
+                                     unsigned size,
+                                     MemTxAttrs attrs);
+ 
++    /* Optional byte-buffer accesses. The caller clips len to one section. */
++    MemTxResult (*bulk_read)(void *opaque, hwaddr addr, void *buf,
++                             hwaddr len, MemTxAttrs attrs);
++    MemTxResult (*bulk_write)(void *opaque, hwaddr addr, const void *buf,
++                              hwaddr len, MemTxAttrs attrs);
++    void *bulk_opaque;
++
+     enum device_endian endianness;
+     /* Guest-visible constraints: */
+     struct {
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -3252,6 +3252,21 @@
+         MemTxResult result;
+         bool release_lock = prepare_mmio_access(mr);
+ 
++        if (mr->ops->bulk_write) {
++            /*
++             * A region that sets bulk_write accepts one contiguous run of
++             * any length. flatview_translate clipped *l to this section, so
++             * one callback serves the complete run. Keep *l unchanged so
++             * the caller advances by the full run.
++             */
++            result = mr->ops->bulk_write(mr->ops->bulk_opaque, mr_addr,
++                                         buf, *l, attrs);
++            if (release_lock) {
++                bql_unlock();
++            }
++            return result;
++        }
++
+         *l = memory_access_size(mr, *l, mr_addr);
+         /*
+          * XXX: could force current_cpu to NULL to avoid
+@@ -3349,6 +3364,16 @@
+         MemTxResult result;
+         bool release_lock = prepare_mmio_access(mr);
+ 
++        if (mr->ops->bulk_read) {
++            /* See flatview_write_continue_step for the bulk contract. */
++            result = mr->ops->bulk_read(mr->ops->bulk_opaque, mr_addr,
++                                        buf, *l, attrs);
++            if (release_lock) {
++                bql_unlock();
++            }
++            return result;
++        }
++
+         *l = memory_access_size(mr, *l, mr_addr);
+         result = memory_region_dispatch_read(mr, mr_addr, &val, size_memop(*l),
+                                              attrs);
+--- a/libqemu/exports.py
++++ b/libqemu/exports.py
+@@ -177,6 +177,10 @@
+ ExportedFct('mr_ops_set_max_access_size', 'void',
+         [ 'MemoryRegionOps *', 'unsigned' ], priv = 'libqemu_mr_ops_max_access_size')
+ 
++ExportedFct('mr_ops_set_bulk_cb', 'void',
++        [ 'MemoryRegionOps *', 'LibQemuMrBulkReadCb', 'LibQemuMrBulkWriteCb',
++          'void *' ], priv = 'libqemu_mr_ops_set_bulk_cb')
++
+ ExportedType('QemuAddressSpace', 'AddressSpace')
+ ExportedFct('address_space_new', 'AddressSpace *', [], priv = 'libqemu_address_space_new')
+ ExportedFct('address_space_free', 'void', [ 'AddressSpace *' ], priv = 'libqemu_address_space_free')
+--- a/libqemu/wrappers/memory.c
++++ b/libqemu/wrappers/memory.c
+@@ -54,6 +54,16 @@
+     ops->impl.max_access_size = size;
+ }
+ 
++void libqemu_mr_ops_set_bulk_cb(MemoryRegionOps *ops,
++                                LibQemuMrBulkReadCb read_cb,
++                                LibQemuMrBulkWriteCb write_cb,
++                                void *opaque)
++{
++    ops->bulk_read = read_cb;
++    ops->bulk_write = write_cb;
++    ops->bulk_opaque = opaque;
++}
++
+ MemoryRegion* libqemu_memory_region_new(void)
+ {
+     return g_new0(MemoryRegion, 1);
+@@ -211,6 +221,10 @@
+ 
+     wrapper->read_cb = ops->read_with_attrs;
+     wrapper->write_cb = ops->write_with_attrs;
++    /* A bulk callback receives the caller's opaque, not this wrapper. */
++    wrapper->ops.bulk_read = ops->bulk_read;
++    wrapper->ops.bulk_write = ops->bulk_write;
++    wrapper->ops.bulk_opaque = ops->bulk_opaque;
+     wrapper->ops.valid.max_access_size = ops->valid.max_access_size;
+     wrapper->ops.impl.max_access_size = ops->impl.max_access_size;
+     wrapper->opaque = opaque;
+--- a/libqemu/wrappers/memory.h
++++ b/libqemu/wrappers/memory.h
+@@ -43,11 +43,27 @@
+                                         unsigned int size,
+                                         MemTxAttrs attrs);
+ 
++typedef MemTxResult (*LibQemuMrBulkReadCb)(void *opaque,
++                                          hwaddr addr,
++                                          void *buf,
++                                          hwaddr len,
++                                          MemTxAttrs attrs);
++
++typedef MemTxResult (*LibQemuMrBulkWriteCb)(void *opaque,
++                                           hwaddr addr,
++                                           const void *buf,
++                                           hwaddr len,
++                                           MemTxAttrs attrs);
++
+ MemoryRegionOps *libqemu_mr_ops_new(void);
+ void libqemu_mr_ops_free(MemoryRegionOps *);
+ void libqemu_mr_ops_set_read_cb(MemoryRegionOps *ops, LibQemuMrReadCb cb);
+ void libqemu_mr_ops_set_write_cb(MemoryRegionOps *ops, LibQemuMrWriteCb cb);
+ void libqemu_mr_ops_max_access_size(MemoryRegionOps *ops, unsigned int size);
++void libqemu_mr_ops_set_bulk_cb(MemoryRegionOps *ops,
++                                LibQemuMrBulkReadCb read_cb,
++                                LibQemuMrBulkWriteCb write_cb,
++                                void *opaque);
+ 
+ MemoryRegion* libqemu_memory_region_new(void);
+ void libqemu_memory_region_init_io(MemoryRegion *mr, Object *obj, const MemoryRegionOps *ops,

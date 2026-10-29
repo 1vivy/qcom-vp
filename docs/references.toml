@@ -1,0 +1,48 @@
+# Evidence stores for root Markdown, docs, and models.
+#
+# A reference cites a source by identity:
+#   git object:     https://github.com/<owner>/<repo>/blob/<commit>/<path>
+#                   or `<owner>/<repo>@<commit>:<path>` or `<store>@<commit>:<path>`
+#   untracked file: `<store>:<path> sha256=<digest>`
+#
+# A store names its source and its environment variable. This tracked file
+# holds no local location. To check a store on one machine, set its `env`
+# variable to the local directory. An alternative is `--manifest` with a
+# private manifest that sets `root` for the store. A relative `root` starts at
+# the directory that holds that manifest. An optional `root` in this file
+# behaves the same way.
+# Check every reference with `cargo run --locked -p qcom-vp -- references`.
+# A store without a local source reports an actionable error. Such a store is
+# not verified. See docs/evidence.md.
+
+schema = 1
+
+[stores.gobbl]
+remote = "1vivy/gobbl"
+env = "QCOM_VP_REF_GOBBL"
+obtain = "git clone https://github.com/1vivy/gobbl"
+
+[stores.gobbl-lab]
+remote = "1vivy/gobbl-lab"
+env = "QCOM_VP_REF_GOBBL_LAB"
+obtain = "git clone https://github.com/1vivy/gobbl-lab. Record evidence directories are untracked and stay with the lab checkout."
+
+[stores.qcom-rehost]
+env = "QCOM_VP_REF_QCOM_REHOST"
+obtain = "Local git repository without a remote. Its inputs directory is untracked and may be absent on other machines."
+
+[stores.edl-re]
+env = "QCOM_VP_REF_EDL_RE"
+obtain = "EDL research workspace. It holds pbl8850.bin and the CPH2749 and CPH2771 firmware exports. It is not a git repository."
+
+[stores.artifacts]
+env = "QCOM_VP_REF_ARTIFACTS"
+obtain = "Workspace evidence store. Each directory is <date>-<topic> with a SHA256SUMS file."
+
+[stores.qcom-vp-probes]
+env = "QCOM_VP_REF_PROBES"
+obtain = "Raw Gobbl peek captures from the test device."
+
+[stores.crashdumps]
+env = "QCOM_VP_REF_CRASHDUMPS"
+obtain = "Output root of the qcom-900e capture service. Each capture has files.tsv and sha256sums.txt."

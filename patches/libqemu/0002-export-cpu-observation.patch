@@ -1,0 +1,90 @@
+diff --git a/libqemu/exports.py b/libqemu/exports.py
+--- a/libqemu/exports.py
++++ b/libqemu/exports.py
+@@ -359,5 +359,11 @@
+ ExportedFct('cpu_get_mem_io_pc', 'uintptr_t', [ 'Object *' ], priv = 'libqemu_cpu_get_mem_io_pc')
+ ExportedFct('cpu_set_vcpu_dirty', 'void', [ 'Object *', 'bool' ],
+         priv = 'libqemu_cpu_set_vcpu_dirty')
++ExportedFct('cpu_get_pc', 'uint64_t', [ 'Object *' ],
++        priv = 'libqemu_cpu_get_pc')
++ExportedFct('cpu_invalidate_code', 'void', [ 'Object *', 'uint64_t', 'uint64_t' ],
++        priv = 'libqemu_cpu_invalidate_code')
++ExportedFct('cpu_get_halted', 'bool', [ 'Object *' ],
++        priv = 'libqemu_cpu_get_halted')
+ 
+ PrivateInclude('libqemu/wrappers/gdbserver.h')
+@@ -381,4 +387,5 @@
+ PrivateInclude('exec/translation-block.h')
+-ExportedFct('tb_invalidate_phys_range', 'void', [ 'uint64_t', 'uint64_t' ])
++ExportedFct('tb_invalidate_phys_range', 'void', [ 'uint64_t', 'uint64_t' ],
++        priv = 'libqemu_tb_invalidate_phys_range')
+ 
+ PrivateInclude('libqemu/wrappers/chardev.h')
+diff --git a/libqemu/wrappers/cpu.h b/libqemu/wrappers/cpu.h
+--- a/libqemu/wrappers/cpu.h
++++ b/libqemu/wrappers/cpu.h
+@@ -49,3 +49,7 @@
+ void libqemu_cpu_set_vcpu_dirty(Object *obj, bool dirty);
++uint64_t libqemu_cpu_get_pc(Object *obj);
++void libqemu_cpu_invalidate_code(Object *obj, uint64_t address, uint64_t size);
++void libqemu_tb_invalidate_phys_range(uint64_t start, uint64_t last);
++bool libqemu_cpu_get_halted(Object *obj);
+ 
+ #endif
+diff --git a/libqemu/wrappers/cpu.c b/libqemu/wrappers/cpu.c
+--- a/libqemu/wrappers/cpu.c
++++ b/libqemu/wrappers/cpu.c
+@@ -32,2 +32,4 @@
+ #include "accel/tcg/cpu-loop.h"
++#include "exec/translation-block.h"
++#include "system/memory.h"
+ 
+@@ -239,4 +241,48 @@
+ void libqemu_cpu_set_vcpu_dirty(Object *obj, bool dirty)
+ {
+     CPU(obj)->vcpu_dirty = dirty;
+ }
++
++uint64_t libqemu_cpu_get_pc(Object *obj)
++{
++    CPUState *cpu = CPU(obj);
++    return CPU_GET_CLASS(cpu)->get_pc(cpu);
++}
++
++/* WFI and powered-off states set this field. The read does not take the BQL. */
++bool libqemu_cpu_get_halted(Object *obj)
++{
++    return qatomic_read(&CPU(obj)->halted) != 0;
++}
++
++void libqemu_tb_invalidate_phys_range(uint64_t start, uint64_t last)
++{
++    tb_invalidate_phys_range(NULL, start, last);
++}
++
++/* Call this function from an asynchronous safe callback on the target CPU. */
++void libqemu_cpu_invalidate_code(Object *obj, uint64_t address, uint64_t size)
++{
++    CPUState *cpu = CPU(obj);
++    AddressSpace *as = cpu_get_address_space(cpu, 0);
++
++    g_assert(size > 0 && address <= UINT64_MAX - (size - 1));
++    WITH_RCU_READ_LOCK_GUARD() {
++        while (size) {
++            hwaddr offset;
++            hwaddr length = size;
++            MemoryRegion *mr = address_space_translate(as, address, &offset,
++                                                      &length, false,
++                                                      MEMTXATTRS_UNSPECIFIED);
++            g_assert(length > 0);
++            if (memory_region_is_ram(mr)) {
++                ram_addr_t start = memory_region_get_ram_addr(mr) + offset;
++                tb_invalidate_phys_range(NULL, start, start + length - 1);
++            }
++            size -= length;
++            if (size) {
++                address += length;
++            }
++        }
++    }
++}

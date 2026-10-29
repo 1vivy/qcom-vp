@@ -1,0 +1,460 @@
+--- a/hw/ufs/ufs.h
++++ b/hw/ufs/ufs.h
+@@ -102,6 +102,7 @@
+     uint8_t mcq_maxq; /* MCQ Maximum number of Queues */
+     uint32_t wb_max_size; /* WB Maximum allocation units */
+     uint32_t wb_min_size; /* WB Minimum allocation units */
++    uint32_t rpmb_size_kib; /* RPMB region 0 size, zero disables RPMB */
+ } UfsParams;
+ 
+ /*
+@@ -149,6 +150,25 @@
+     uint64_t pinned_total_written_bytes;
+ } UfsWb;
+ 
++/*
++ * JESD220 RPMB well-known LU state. The key, write counter, and data are
++ * nonvolatile device state. Pending frames hold one SECURITY PROTOCOL IN
++ * response. The result frame answers a later result read request.
++ */
++#define UFS_RPMB_FRAME_SIZE 512
++#define UFS_RPMB_BLOCK_SIZE 256
++typedef struct UfsRpmb {
++    uint8_t key[32];
++    bool key_programmed;
++    uint32_t write_counter;
++    uint32_t blocks;
++    uint8_t *data;
++    uint8_t result[UFS_RPMB_FRAME_SIZE];
++    bool result_valid;
++    uint8_t *pending;
++    uint32_t pending_frames;
++} UfsRpmb;
++
+ typedef struct UfsHc {
+     union {
+         PCIDevice parent_obj;
+@@ -194,6 +214,7 @@
+ 
+     /* Extended features */
+     UfsWb wb;
++    UfsRpmb rpmb;
+ 
+     uint8_t temperature;
+ 
+@@ -215,6 +236,14 @@
+     AddressSpace *mem_as;
+ } UfsHc;
+ 
++static inline void ufs_rpmb_clear_responses(UfsHc *u)
++{
++    g_free(u->rpmb.pending);
++    u->rpmb.pending = NULL;
++    u->rpmb.pending_frames = 0;
++    u->rpmb.result_valid = false;
++}
++
+ static inline uint32_t ufs_mcq_sq_tail(UfsHc *u, uint32_t qid)
+ {
+     return u->mcq_op_reg[qid].sq.tp;
+--- a/hw/ufs/ufs.c
++++ b/hw/ufs/ufs.c
+@@ -2076,13 +2076,25 @@
+     return ret;
+ }
+ 
+-static const RpmbUnitDescriptor rpmb_unit_desc = {
+-    .length = sizeof(RpmbUnitDescriptor),
+-    .descriptor_idn = 2,
+-    .unit_index = UFS_UPIU_RPMB_WLUN,
+-    .lu_enable = 0,
+-};
++/* bRPMBRegion0Size counts 128 KiB units at descriptor offset 0x13. */
++#define UFS_RPMB_REGION_UNIT_KIB 128
+ 
++static void ufs_build_rpmb_unit_desc(UfsHc *u, RpmbUnitDescriptor *desc)
++{
++    memset(desc, 0, sizeof(*desc));
++    desc->length = sizeof(RpmbUnitDescriptor);
++    desc->descriptor_idn = 2;
++    desc->unit_index = UFS_UPIU_RPMB_WLUN;
++    if (!u->rpmb.blocks) {
++        return;
++    }
++    desc->lu_enable = 1;
++    desc->logical_block_size = 8; /* 2^8 = 256-byte RPMB blocks */
++    desc->logical_block_count = cpu_to_be64(u->rpmb.blocks);
++    ((uint8_t *)desc)[0x13] =
++        u->params.rpmb_size_kib / UFS_RPMB_REGION_UNIT_KIB;
++}
++
+ static QueryRespCode ufs_read_unit_desc(UfsRequest *req)
+ {
+     UfsHc *u = req->hc;
+@@ -2095,6 +2107,8 @@
+     }
+ 
+     if (lun == UFS_UPIU_RPMB_WLUN) {
++        RpmbUnitDescriptor rpmb_unit_desc;
++        ufs_build_rpmb_unit_desc(u, &rpmb_unit_desc);
+         memcpy(&req->rsp_upiu.qr.data, &rpmb_unit_desc, rpmb_unit_desc.length);
+     } else {
+         memcpy(&req->rsp_upiu.qr.data, &u->lus[lun]->unit_desc,
+@@ -2816,6 +2830,14 @@
+         return false;
+     }
+ 
++    if (u->params.rpmb_size_kib % UFS_RPMB_REGION_UNIT_KIB ||
++        u->params.rpmb_size_kib > 255 * UFS_RPMB_REGION_UNIT_KIB) {
++        error_setg(errp, "rpmb-size-kib must be a multiple of %u KiB up to "
++                   "%u KiB", UFS_RPMB_REGION_UNIT_KIB,
++                   255 * UFS_RPMB_REGION_UNIT_KIB);
++        return false;
++    }
++
+     return true;
+ }
+ 
+@@ -2843,6 +2865,8 @@
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTRLRDY, 0);
+         u->reg.hcs = FIELD_DP32(u->reg.hcs, HCS, UTMRLRDY, 0);
+         u->flags.device_init = 0;
++        /* Responses are volatile. The key, counter, and data persist. */
++        ufs_rpmb_clear_responses(u);
+         u->peer_tactivate = 10;
+         for (unsigned i = 0; i < UFS_MAX_LUS; i++) {
+             if (u->lus[i] && u->lus[i]->scsi_dev) {
+@@ -2896,6 +2920,11 @@
+         memset(u->sq, 0, sizeof(u->sq));
+         memset(u->cq, 0, sizeof(u->cq));
+     }
++
++    u->rpmb.blocks = u->params.rpmb_size_kib * 1024 / UFS_RPMB_BLOCK_SIZE;
++    if (u->rpmb.blocks) {
++        u->rpmb.data = g_malloc0((size_t)u->rpmb.blocks * UFS_RPMB_BLOCK_SIZE);
++    }
+ }
+ 
+ static void ufs_wb_init(UfsHc *u)
+@@ -3115,6 +3144,9 @@
+         ufs_clear_req(&u->req_list[i]);
+     }
+     g_free(u->req_list);
++    ufs_rpmb_clear_responses(u);
++    g_free(u->rpmb.data);
++    u->rpmb.data = NULL;
+ 
+     for (int i = 0; i < ARRAY_SIZE(u->sq); i++) {
+         if (u->sq[i]) {
+@@ -3147,6 +3179,7 @@
+     DEFINE_PROP_UINT8("mcq-maxq", UfsHc, params.mcq_maxq, 2),
+     DEFINE_PROP_UINT32("wb-max-size", UfsHc, params.wb_max_size, 0x400),
+     DEFINE_PROP_UINT32("wb-min-size", UfsHc, params.wb_min_size, 0x100),
++    DEFINE_PROP_UINT32("rpmb-size-kib", UfsHc, params.rpmb_size_kib, 0),
+ };
+ 
+ static const VMStateDescription ufs_vmstate = {
+--- a/hw/ufs/lu.c
++++ b/hw/ufs/lu.c
+@@ -16,6 +16,7 @@
+ #include "scsi/constants.h"
+ #include "system/block-backend.h"
+ #include "qemu/cutils.h"
++#include "crypto/hmac.h"
+ #include "trace.h"
+ #include "ufs.h"
+ 
+@@ -308,6 +309,277 @@
+     return SCSI_INQUIRY_LEN;
+ }
+ 
++/*
++ * JESD220 RPMB frames. Big-endian fields follow the 196 stuff bytes. The
++ * HMAC-SHA256 MAC covers bytes 228..511 of every frame in one message.
++ */
++#define UFS_SECURITY_PROTOCOL_IN 0xa2
++#define UFS_SECURITY_PROTOCOL_OUT 0xb5
++#define UFS_RPMB_PROTOCOL 0xec
++#define UFS_RPMB_PROTOCOL_SPECIFIC 0x0001
++#define UFS_RPMB_MAC 196
++#define UFS_RPMB_DATA 228
++#define UFS_RPMB_NONCE 484
++#define UFS_RPMB_COUNTER 500
++#define UFS_RPMB_ADDRESS 504
++#define UFS_RPMB_BLOCKS 506
++#define UFS_RPMB_RESULT 508
++#define UFS_RPMB_TYPE 510
++
++enum {
++    UFS_RPMB_KEY_PROGRAM = 1,
++    UFS_RPMB_READ_COUNTER = 2,
++    UFS_RPMB_WRITE = 3,
++    UFS_RPMB_READ = 4,
++    UFS_RPMB_RESULT_READ = 5,
++};
++
++enum {
++    UFS_RPMB_OK = 0,
++    UFS_RPMB_GENERAL_FAILURE = 1,
++    UFS_RPMB_AUTH_FAILURE = 2,
++    UFS_RPMB_COUNTER_FAILURE = 3,
++    UFS_RPMB_ADDRESS_FAILURE = 4,
++    UFS_RPMB_WRITE_FAILURE = 5,
++    UFS_RPMB_NO_KEY = 7,
++    UFS_RPMB_COUNTER_EXPIRED = 0x80,
++};
++
++static bool ufs_rpmb_mac(const UfsRpmb *rpmb, const uint8_t *frames,
++                         uint32_t count, uint8_t *mac)
++{
++    g_autofree struct iovec *iov = g_new(struct iovec, count);
++    g_autofree uint8_t *result = NULL;
++    size_t result_len = 0;
++    QCryptoHmac *hmac;
++    int ret;
++
++    for (uint32_t i = 0; i < count; i++) {
++        iov[i].iov_base = (void *)(frames + i * UFS_RPMB_FRAME_SIZE +
++                                   UFS_RPMB_DATA);
++        iov[i].iov_len = UFS_RPMB_FRAME_SIZE - UFS_RPMB_DATA;
++    }
++    hmac = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA256, rpmb->key,
++                            sizeof(rpmb->key), NULL);
++    if (!hmac) {
++        return false;
++    }
++    ret = qcrypto_hmac_bytesv(hmac, iov, count, &result, &result_len, NULL);
++    qcrypto_hmac_free(hmac);
++    if (ret < 0 || result_len != 32) {
++        return false;
++    }
++    memcpy(mac, result, 32);
++    return true;
++}
++
++/* Without a programmed key the device returns a zero MAC. */
++static bool ufs_rpmb_sign(const UfsRpmb *rpmb, uint8_t *frames, uint32_t count)
++{
++    if (!rpmb->key_programmed) {
++        return true;
++    }
++    return ufs_rpmb_mac(rpmb, frames, count, frames +
++                        (count - 1) * UFS_RPMB_FRAME_SIZE + UFS_RPMB_MAC);
++}
++
++static uint8_t *ufs_rpmb_response(UfsRpmb *rpmb, uint32_t count)
++{
++    g_free(rpmb->pending);
++    rpmb->pending = g_malloc0((size_t)count * UFS_RPMB_FRAME_SIZE);
++    rpmb->pending_frames = count;
++    return rpmb->pending;
++}
++
++static void ufs_rpmb_drop_response(UfsRpmb *rpmb)
++{
++    g_free(rpmb->pending);
++    rpmb->pending = NULL;
++    rpmb->pending_frames = 0;
++}
++
++static uint16_t ufs_rpmb_counter_state(const UfsRpmb *rpmb)
++{
++    return rpmb->write_counter == UINT32_MAX ? UFS_RPMB_COUNTER_EXPIRED : 0;
++}
++
++/* Returns the result code of an authenticated write. */
++static uint16_t ufs_rpmb_write(UfsRpmb *rpmb, const uint8_t *frames,
++                               uint32_t count)
++{
++    const uint8_t *last = frames + (count - 1) * UFS_RPMB_FRAME_SIZE;
++    uint16_t address = lduw_be_p(frames + UFS_RPMB_ADDRESS);
++    uint16_t blocks = lduw_be_p(frames + UFS_RPMB_BLOCKS);
++    uint8_t mac[32];
++
++    if (!rpmb->key_programmed) {
++        return UFS_RPMB_NO_KEY;
++    }
++    if (rpmb->write_counter == UINT32_MAX) {
++        return UFS_RPMB_COUNTER_EXPIRED | UFS_RPMB_WRITE_FAILURE;
++    }
++    if (!ufs_rpmb_mac(rpmb, frames, count, mac) ||
++        memcmp(mac, last + UFS_RPMB_MAC, sizeof(mac))) {
++        return UFS_RPMB_AUTH_FAILURE;
++    }
++    if (ldl_be_p(last + UFS_RPMB_COUNTER) != rpmb->write_counter) {
++        return UFS_RPMB_COUNTER_FAILURE;
++    }
++    if (blocks != count || (uint32_t)address + blocks > rpmb->blocks) {
++        return UFS_RPMB_ADDRESS_FAILURE;
++    }
++    for (uint32_t i = 0; i < count; i++) {
++        memcpy(rpmb->data + ((size_t)address + i) * UFS_RPMB_BLOCK_SIZE,
++               frames + i * UFS_RPMB_FRAME_SIZE + UFS_RPMB_DATA,
++               UFS_RPMB_BLOCK_SIZE);
++    }
++    rpmb->write_counter++;
++    return UFS_RPMB_OK;
++}
++
++/* Applies one SECURITY PROTOCOL OUT message. False rejects the parameter list. */
++static bool ufs_rpmb_out(UfsHc *u, const uint8_t *frames, uint32_t count)
++{
++    UfsRpmb *rpmb = &u->rpmb;
++    uint16_t type = lduw_be_p(frames + UFS_RPMB_TYPE);
++    uint16_t result;
++    uint8_t *rsp;
++
++    for (uint32_t i = 1; i < count; i++) {
++        if (lduw_be_p(frames + i * UFS_RPMB_FRAME_SIZE + UFS_RPMB_TYPE) !=
++            UFS_RPMB_WRITE) {
++            return false;
++        }
++    }
++    if (count != 1 && (type != UFS_RPMB_WRITE ||
++                       count > u->geometry_desc.rpmb_read_write_size)) {
++        return false;
++    }
++
++    switch (type) {
++    case UFS_RPMB_KEY_PROGRAM:
++        ufs_rpmb_drop_response(rpmb);
++        result = UFS_RPMB_OK;
++        if (rpmb->key_programmed) {
++            result = UFS_RPMB_GENERAL_FAILURE;
++        } else {
++            memcpy(rpmb->key, frames + UFS_RPMB_MAC, sizeof(rpmb->key));
++            rpmb->key_programmed = true;
++        }
++        memset(rpmb->result, 0, sizeof(rpmb->result));
++        stw_be_p(rpmb->result + UFS_RPMB_RESULT, result);
++        stw_be_p(rpmb->result + UFS_RPMB_TYPE, UFS_RPMB_KEY_PROGRAM << 8);
++        rpmb->result_valid = true;
++        return true;
++    case UFS_RPMB_READ_COUNTER:
++        rsp = ufs_rpmb_response(rpmb, 1);
++        memcpy(rsp + UFS_RPMB_NONCE, frames + UFS_RPMB_NONCE, 16);
++        result = UFS_RPMB_NO_KEY;
++        if (rpmb->key_programmed) {
++            stl_be_p(rsp + UFS_RPMB_COUNTER, rpmb->write_counter);
++            result = UFS_RPMB_OK | ufs_rpmb_counter_state(rpmb);
++        }
++        stw_be_p(rsp + UFS_RPMB_RESULT, result);
++        stw_be_p(rsp + UFS_RPMB_TYPE, UFS_RPMB_READ_COUNTER << 8);
++        return ufs_rpmb_sign(rpmb, rsp, 1);
++    case UFS_RPMB_WRITE:
++        ufs_rpmb_drop_response(rpmb);
++        result = ufs_rpmb_write(rpmb, frames, count);
++        memset(rpmb->result, 0, sizeof(rpmb->result));
++        if (rpmb->key_programmed) {
++            stl_be_p(rpmb->result + UFS_RPMB_COUNTER, rpmb->write_counter);
++        }
++        memcpy(rpmb->result + UFS_RPMB_ADDRESS, frames + UFS_RPMB_ADDRESS, 2);
++        stw_be_p(rpmb->result + UFS_RPMB_RESULT,
++                 result | ufs_rpmb_counter_state(rpmb));
++        stw_be_p(rpmb->result + UFS_RPMB_TYPE, UFS_RPMB_WRITE << 8);
++        rpmb->result_valid = true;
++        return ufs_rpmb_sign(rpmb, rpmb->result, 1);
++    case UFS_RPMB_READ: {
++        uint16_t address = lduw_be_p(frames + UFS_RPMB_ADDRESS);
++        uint16_t blocks = lduw_be_p(frames + UFS_RPMB_BLOCKS);
++
++        if (!blocks || blocks > u->geometry_desc.rpmb_read_write_size) {
++            return false;
++        }
++        rsp = ufs_rpmb_response(rpmb, blocks);
++        result = UFS_RPMB_OK;
++        if (!rpmb->key_programmed) {
++            result = UFS_RPMB_NO_KEY;
++        } else if ((uint32_t)address + blocks > rpmb->blocks) {
++            result = UFS_RPMB_ADDRESS_FAILURE;
++        }
++        for (uint32_t i = 0; i < blocks; i++) {
++            uint8_t *frame = rsp + i * UFS_RPMB_FRAME_SIZE;
++            if (result == UFS_RPMB_OK) {
++                memcpy(frame + UFS_RPMB_DATA, rpmb->data +
++                       ((size_t)address + i) * UFS_RPMB_BLOCK_SIZE,
++                       UFS_RPMB_BLOCK_SIZE);
++            }
++            memcpy(frame + UFS_RPMB_NONCE, frames + UFS_RPMB_NONCE, 16);
++            stw_be_p(frame + UFS_RPMB_ADDRESS, address);
++            stw_be_p(frame + UFS_RPMB_BLOCKS, blocks);
++            stw_be_p(frame + UFS_RPMB_RESULT, result);
++            stw_be_p(frame + UFS_RPMB_TYPE, UFS_RPMB_READ << 8);
++        }
++        return ufs_rpmb_sign(rpmb, rsp, blocks);
++    }
++    case UFS_RPMB_RESULT_READ:
++        rsp = ufs_rpmb_response(rpmb, 1);
++        if (rpmb->result_valid) {
++            memcpy(rsp, rpmb->result, UFS_RPMB_FRAME_SIZE);
++        } else {
++            stw_be_p(rsp + UFS_RPMB_RESULT, UFS_RPMB_GENERAL_FAILURE);
++            stw_be_p(rsp + UFS_RPMB_TYPE, UFS_RPMB_RESULT_READ << 8);
++        }
++        return true;
++    default:
++        return false;
++    }
++}
++
++static void ufs_rpmb_security_protocol(UfsLu *lu, UfsRequest *req,
++                                       uint8_t *sense_buf, uint8_t *scsi_status,
++                                       uint32_t *transferred)
++{
++    const uint8_t *cdb = req->req_upiu.sc.cdb;
++    UfsHc *u = req->hc;
++    uint32_t length = ldl_be_p(cdb + 6);
++    bool out = cdb[0] == UFS_SECURITY_PROTOCOL_OUT;
++
++    *transferred = 0;
++    *scsi_status = CHECK_CONDITION;
++    if (lu->lun != UFS_UPIU_RPMB_WLUN || !u->rpmb.blocks) {
++        scsi_build_sense(sense_buf, SENSE_CODE(INVALID_OPCODE));
++        return;
++    }
++    if (cdb[1] != UFS_RPMB_PROTOCOL ||
++        lduw_be_p(cdb + 2) != UFS_RPMB_PROTOCOL_SPECIFIC || (cdb[4] & 0x80) ||
++        !length || length % UFS_RPMB_FRAME_SIZE || length > req->data_len) {
++        scsi_build_sense(sense_buf, SENSE_CODE(INVALID_FIELD));
++        return;
++    }
++    if (out) {
++        g_autofree uint8_t *frames = g_malloc(length);
++        if (dma_buf_write(frames, length, NULL, req->sg,
++                          MEMTXATTRS_UNSPECIFIED) != MEMTX_OK ||
++            !ufs_rpmb_out(u, frames, length / UFS_RPMB_FRAME_SIZE)) {
++            scsi_build_sense(sense_buf, SENSE_CODE(INVALID_PARAM));
++            return;
++        }
++    } else {
++        if (length != u->rpmb.pending_frames * UFS_RPMB_FRAME_SIZE ||
++            dma_buf_read(u->rpmb.pending, length, NULL, req->sg,
++                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++            scsi_build_sense(sense_buf, SENSE_CODE(INVALID_FIELD));
++            return;
++        }
++        ufs_rpmb_drop_response(&u->rpmb);
++    }
++    *transferred = length;
++    *scsi_status = GOOD;
++}
++
+ static UfsReqResult ufs_emulate_scsi_cmd(UfsLu *lu, UfsRequest *req)
+ {
+     uint8_t lun = lu->lun;
+@@ -317,6 +589,15 @@
+     int len = 0;
+ 
+     switch (req->req_upiu.sc.cdb[0]) {
++    case UFS_SECURITY_PROTOCOL_IN:
++    case UFS_SECURITY_PROTOCOL_OUT: {
++        uint32_t transferred;
++        ufs_rpmb_security_protocol(lu, req, sense_buf, &scsi_status,
++                                   &transferred);
++        ufs_build_scsi_response_upiu(req, sense_buf, sizeof(sense_buf),
++                                     transferred, scsi_status);
++        return UFS_REQUEST_SUCCESS;
++    }
+     case TEST_UNIT_READY: {
+         const uint8_t *cdb = req->req_upiu.sc.cdb;
+         UfsHc *u = req->hc;

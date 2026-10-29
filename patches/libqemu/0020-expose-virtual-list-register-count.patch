@@ -1,0 +1,33 @@
+From: qcom-vp maintainers
+Subject: [PATCH] arm: expose the virtual GIC list-register count on TCG max
+
+QHEE writes ICH_LR4_EL2 (S3_4_C12_C12_4) while it programs the virtual GIC for
+the guest. Every max TCG core sets gic_num_lrs to four, and the cpu interface
+then defines ICH_LR0..LR3 only, so the fifth list register traps as an
+unsupported system register and QHEE stops in its unknown-trap handler.
+
+Expose the count as an opt-in property so a profile can state the list-register
+capacity it needs. The default keeps the existing value of four.
+
+Source: Arm IHI 0069 (GICv3/v4 architecture), ICH_VTR_EL2.ListRegs.
+https://developer.arm.com/documentation/ihi0069/
+
+--- a/target/arm/tcg/cpu64.c
++++ b/target/arm/tcg/cpu64.c
+@@ -1172,6 +1172,8 @@
+         DEFINE_PROP_BOOL("x-qcom-mpam", ARMCPU, qcom_mpam, false);
+     static const Property qcom_ids_property =
+         DEFINE_PROP_BOOL("x-qcom-ids", ARMCPU, qcom_ids, false);
++    static const Property qcom_gic_lr_property =
++        DEFINE_PROP_INT32("x-qcom-gic-num-lrs", ARMCPU, gic_num_lrs, 4);
+ #endif
+     uint64_t t;
+     uint32_t u;
+@@ -1455,6 +1457,7 @@
+ #ifndef CONFIG_USER_ONLY
+     qdev_property_add_static(DEVICE(obj), &qcom_mpam_property);
+     qdev_property_add_static(DEVICE(obj), &qcom_ids_property);
++    qdev_property_add_static(DEVICE(obj), &qcom_gic_lr_property);
+ #endif
+ }
+ 

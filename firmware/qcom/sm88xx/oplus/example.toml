@@ -1,0 +1,59 @@
+# Copy this file to a private directory and edit it.
+# Every hash below is a placeholder. Replace each one with the SHA-256 of your file.
+# docs/qcom/sm88xx/oplus/firmware-inputs.md explains every key.
+schema = 1
+platform = "sm8850"
+# A free label. Installed Oplus boards are in boards/qcom/sm88xx/oplus/.
+# Set [board_file] for another device.
+board = "oplus-infiniti"
+auth = "retail"
+rom_compatibility = false
+# For sm8845, set platform = "sm8845" and rom_compatibility = true.
+omit_secdata = true
+# Generic patches run in this order, before optional TME reconstruction.
+# Reconstruction rejects patches that change its pinned TME preimage.
+patches = []
+
+# Optional board file instead of an installed board. It must define ufs_boot_lun.
+# [board_file]
+# path = "/private/my-board.lua"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Optional authenticated sequencer trust. Set both keys or neither key.
+# sequencer_entitlement_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# [sequencer_root]
+# path = "/private/sequencer-root.bin"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# The fuse-backed OEM policy requires the complete DER root certificate.
+# [oem_root]
+# path = "/private/oem-root.der"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# The PBL image is 0x3c000 bytes. The hash covers the image only.
+# offset is the file offset of the image inside the file. The default is 0.
+# cpucp_offset is the CPUCP image offset inside the PBL image. The default is 0x34000.
+[pbl]
+path = "/private/pbl.bin"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# offset = 0
+# cpucp_offset = 0x34000
+
+# The TME image is 0x20000 bytes.
+[tme]
+path = "/private/tme.bin"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+# offset = 0
+
+# Optional common reconstruction for both supported platforms.
+# Omit this table to preserve the original TME.
+# The embedded recipe names the original and donor images by SHA-256.
+# The donor is private. The installed authored adapter supplies no vendor bytes.
+# Prepare retains both inputs, the adapter, API map, and hash-bound provenance.
+# [tme_runtime_donor]
+# path = "/private/tme-runtime-donor.bin"
+# sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[package]
+path = "/private/package.zip"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

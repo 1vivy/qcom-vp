@@ -1,0 +1,36 @@
+Subject: [PATCH] Report readiness for the UFS device LUN
+
+The device LUN accepts TEST UNIT READY after host enable, link startup,
+and device initialization. Reset or lost device presence reports NOT READY.
+Invalid fields retain CHECK CONDITION. Other commands keep their handlers.
+
+--- a/hw/ufs/lu.c
++++ b/hw/ufs/lu.c
+@@ -316,7 +316,27 @@
+     uint8_t scsi_status;
+     int len = 0;
+ 
+     switch (req->req_upiu.sc.cdb[0]) {
++    case TEST_UNIT_READY: {
++        const uint8_t *cdb = req->req_upiu.sc.cdb;
++        UfsHc *u = req->hc;
++        if (lun != UFS_UPIU_UFS_DEVICE_WLUN) {
++            scsi_build_sense(sense_buf, SENSE_CODE(INVALID_OPCODE));
++            scsi_status = CHECK_CONDITION;
++        } else if (req->data_len || req->req_upiu.sc.exp_data_transfer_len ||
++                   cdb[1] || cdb[2] || cdb[3] || cdb[4] || cdb[5]) {
++            scsi_build_sense(sense_buf, SENSE_CODE(INVALID_FIELD));
++            scsi_status = CHECK_CONDITION;
++        } else if (u->device_reset_asserted || u->flags.device_init ||
++                   !FIELD_EX32(u->reg.hce, HCE, HCE) ||
++                   !FIELD_EX32(u->reg.hcs, HCS, DP)) {
++            scsi_build_sense(sense_buf, SENSE_CODE(LUN_NOT_READY));
++            scsi_status = CHECK_CONDITION;
++        } else {
++            scsi_status = GOOD;
++        }
++        break;
++    }
+     case REPORT_LUNS:
+         len = ufs_emulate_report_luns(req, outbuf, sizeof(outbuf));
+         if (len == SCSI_COMMAND_FAIL) {
