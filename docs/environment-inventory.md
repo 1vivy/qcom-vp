@@ -87,10 +87,10 @@ Two secure-file indexes use an 88-byte prefix and 25-byte entries.
 The matching TZ image uses that entry layout with a configurable capacity.
 The captured capacity is 60 entries, not a universal hardware constant.
 
-Three active index words match fields in their respective objects.
-Primary and backup objects differ, and one backup index references a primary object version-like field.
+Three active index versions match their respective object versions.
+Primary and backup objects differ, and one backup index references a primary object version.
 These relationships rule out an assumption that every backup index selects every backup object.
-Their authentication and commit semantics still require a matched consumer analysis.
+The protocol investigation below qualifies selected validation and recovery paths.
 
 The captured RKP database contains no provisioned-key rows.
 That observation does not establish that all device credential stores are empty.
@@ -102,6 +102,47 @@ The private records separate observations, static firmware facts, and remaining 
 - Content interpretation: `artifacts:2026-10-29-environment-state/interpreted.json sha256=85c95db46459939df6b3eaa2a93d23aa6aa536068df6d4c3a76afde5d00e24e9`.
 - Matched firmware: `artifacts:2026-10-29-environment-state/firmware-facts.json sha256=e95335ec81b3c4784cb483a91b06c65229b0666261b0729524c4438a37b7b8b5`.
 - Offline interpreter: `artifacts:2026-10-29-environment-state/inspect-captures.py sha256=7087dd17c2a2534bdf5bf4a749a28d4f16fbae4417dc8d0b033075ab0a59cd8a`.
+
+### Secure-file validation and recovery
+
+The matched TZ image identifies separate index, metadata, payload, and version-table formats.
+The index tag protects all configured entries, including unused bytes.
+The reader then checks its namespace as a bounded string and compares its version with the selected authority.
+Object metadata also carries a keyed tag.
+Payload digests and cipher inputs reside inside that protected metadata.
+All six captured payload segments reproduce their stored SHA-256 digests.
+
+The version service can select a counter object, an RPMB table, or a protected `vTable` file.
+The captured `vTable` entries match the index identities but contain different versions.
+They therefore do not establish the active authority for those indexes.
+The key wrapper delegates derivation through service `0x0b`.
+This investigation does not establish the root-key provider or recover physical keys.
+
+Original firmware instructions executed in twelve bounded offline scenarios.
+The experiment supplies constructed initialization state, a public test key, real HMAC-SHA256 operations, and an in-memory filesystem.
+It does not replace an integrity decision with a successful status.
+
+1. A correctly protected test index passes its reader.
+2. Tampering, short reads, namespace mismatches, and version mismatches fail and request removal of the candidate.
+3. A valid backup with the expected version replaces a rejected primary.
+4. An older backup fails even when its test-key tag is valid.
+5. The index write precedes the version update.
+6. A failed index write returns before version persistence.
+
+The experiment stops before the RPMB persistence operation.
+It does not claim successful durable updates or physical recovery.
+The validation path can request file removal, so invoking it on a phone is not a passive read.
+No phone command occurred during this protocol investigation.
+
+The captures remain private, and the experiment does not change production model behavior or authentication policy.
+A generated profile still needs coherent keys, identities, versions, payloads, and durable authority.
+The retained artifacts identify the supplied boundaries and the unresolved dependencies:
+
+- Findings: `artifacts:2026-10-29-secure-file-protocol/findings.json sha256=866ad46ee7a6cd9ce5f0685758d335804068defaa3f103d1766f02240b7f2c7b`.
+- Original-code execution: `artifacts:2026-10-29-secure-file-protocol/execution.json sha256=547dc8db42ba24ab9ca9d2d73a869fb06bd9b6c098ea793713f23a337f284758`.
+- Capture interpretation: `artifacts:2026-10-29-secure-file-protocol/decoded.json sha256=573e848de955af60b436aa2ba48d2c9a923f840e561617df0d4935b8783835d3`.
+- Execution instrument: `artifacts:2026-10-29-secure-file-protocol/execute-protocol.py sha256=2060522122b56b44169df5d7a8961c9e604b19822fa6845630ed9962246efc36`.
+- Capture decoder: `artifacts:2026-10-29-secure-file-protocol/decode-captures.py sha256=b8cf1273a75949f73491effad4c47357c4c70c9e58fe7f51a7254e2333a464fc`.
 
 ## Hidden dependencies and disposition
 
