@@ -182,6 +182,16 @@ struct NoCmdBus : sc_core::sc_module {
     }
 };
 
+// AUTH_KEY words take the same CONFIG byte lanes as AUTH_IV. `key_group` builds
+// the big-endian group of four key bytes that Linux programs with bit9 clear.
+// With bit9 set the register word is the byte-reversed group, which is what QSEE
+// stores when it passes the caller's little-endian word unchanged.
+std::uint32_t key_group(const unsigned char* key, unsigned index) {
+    return (std::uint32_t(key[4 * index]) << 24) |
+           (std::uint32_t(key[4 * index + 1]) << 16) |
+           (std::uint32_t(key[4 * index + 2]) << 8) | std::uint32_t(key[4 * index + 3]);
+}
+
 } // namespace
 
 struct Consumer : sc_core::sc_module {
@@ -384,6 +394,26 @@ struct Consumer : sc_core::sc_module {
         write_qce(0xa300, (0x65e52 & ~(hw_key ? 0u : 0x40000u)) | (last ? 0x10000 : 0));
         for (unsigned i = 0; i < 4; ++i) write_qce(0xa390 + i * 4, 0);
     }
+    // Supplied-key AES CMAC. `key_bytes` is 16 or 32. AUTH_KEY0..3 or ..7 take
+    // the CONFIG byte lanes: `little` false writes the big-endian key group as
+    // Linux does, and true writes the byte-reversed group as QSEE does. AUTH_IV
+    // and AUTH_BYTECNT stay under caller control, so a continuation can restore
+    // them after this call and before GO.
+    void cmac_keys(const unsigned char* key, unsigned key_bytes, unsigned length,
+                   bool first, bool last, bool little) {
+        write_qce(0xa400, little ? 0xe020e : 0xe000e);
+        write_qce(0xa200, 0);
+        write_qce(0xa110, length);
+        write_qce(0xa304, length);
+        write_qce(0xa308, 0);
+        for (unsigned i = 0; i < key_bytes / 4; ++i) {
+            const std::uint32_t group = key_group(key, i);
+            write_qce(0xd040 + i * 4, little ? reverse(group) : group);
+        }
+        write_qce(0xa300, 2u | ((key_bytes == 32 ? 2u : 0u) << 3) | (1u << 6) | (0xfu << 9) |
+                                (first ? 0x20000u : 0) | (last ? 0x10000u : 0));
+        for (unsigned i = 0; i < 4; ++i) write_qce(0xa390 + i * 4, 0);
+    }
 };
 
 int sc_main(int argc, char** argv) {
@@ -496,7 +526,109 @@ int sc_main(int argc, char** argv) {
     c.write_bam(0xc818, 0);
     sc_core::sc_start(1, sc_core::SC_NS);
     c.ram.digest(digest_d, "2e8876a7ae576fb3d6dc83aeb779281f", 16);
-    // The plain GO register has no OEM key, and a software AES key is not implemented.
+    // AUTH_KEY words follow the CONFIG byte lanes in both driver forms.
+    // RFC 4493 supplies the AES-128 tags for complete messages.
+    // NIST SP 800-38B supplies the AES-256 tags.
+    // Python cryptography independently checks the partial message and CBC chain.
+    const std::array<unsigned char, 16> key128{
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+        0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c};
+    const std::array<unsigned char, 32> key256{
+        0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+        0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+        0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+        0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4};
+    const unsigned char block16[16]{
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+        0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a};
+    const unsigned char tail4[4]{0xae, 0x2d, 0x8a, 0x57};
+    const unsigned char message64[64]{
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+        0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+        0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c,
+        0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+        0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11,
+        0xe5, 0xfb, 0xc1, 0x19, 0x1a, 0x0a, 0x52, 0xef,
+        0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17,
+        0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c, 0x37, 0x10};
+    // Both pipes hold one element at a time, so each request starts cold.
+    const auto restart = [&] {
+        c.write_bam(0xc014, 0xff);
+        c.write_bam(0xd014, 0xff);
+        c.pipe(0, 0, 24, false);
+        c.pipe(1, 0x100, 16, true);
+    };
+    // Submit the programmed request and check the first 16 result bytes.
+    const auto run = [&](unsigned offset, unsigned length, const char* tag) {
+        c.write_qce(0xa120, 7);
+        c.ram.descriptor(ring1, 0, va_base + 0x5300, 128, 0xc0);
+        c.write_bam(0xd818, 8);
+        if (length) {
+            c.ram.descriptor(ring0, 0, va_base + 0x4400 + offset, length, 0xc0);
+            c.write_bam(0xc818, 8);
+        }
+        sc_core::sc_start(1, sc_core::SC_NS);
+        c.ram.digest(digest_d, tag, 16);
+    };
+
+    // An empty message is one padding block under K2.
+    restart();
+    c.cmac_keys(key256.data(), 32, 0, true, true, false);
+    // Linux changes the byte lanes after key programming, before GO.
+    c.write_qce(0xa400, 0xe020eu);
+    run(0, 0, "028962f61b7bf89efc6b551f4667d983");
+    // AES-256 under CONFIG little-endian mode, the QSEE form. The byte-reversed
+    // key words carry the same key bytes, so the tag matches the same vector.
+    std::memcpy(c.ram.bytes.data() + input_e, message64, sizeof message64);
+    restart();
+    c.cmac_keys(key256.data(), 32, 64, true, true, true);
+    run(0, 64, "e1992190549f6ed5696a2c056c315410");
+    // AES-128 reads AUTH_KEY0..3 only, and a complete final block takes K1.
+    restart();
+    std::memcpy(c.ram.bytes.data() + input_e, block16, sizeof block16);
+    c.cmac_keys(key128.data(), 16, 16, true, true, false);
+    run(0, 16, "070a16b46b4d4144f79bdd9dd04a287c");
+    // A 20-byte message ends in a partial block and takes the padded K2 path.
+    std::memcpy(c.ram.bytes.data() + input_e + 16, tail4, sizeof tail4);
+    restart();
+    c.cmac_keys(key128.data(), 16, 20, true, true, false);
+    run(0, 20, "7d85449ea6ea19c823a7bf78837dfade");
+    // The same message in two segments. The nonfinal request publishes the
+    // CBC-MAC chain AES-128(K, M1), and the final request continues from it.
+    restart();
+    c.cmac_keys(key128.data(), 16, 16, true, false, true);
+    run(0, 16, "3ad77bb40d7a3660a89ecaf32466ef97");
+    std::array<std::uint32_t, 4> chain{};
+    std::array<std::uint32_t, 4> chain_count{};
+    for (unsigned i = 0; i < chain.size(); ++i) chain[i] = c.read_qce(0xa310 + i * 4);
+    for (unsigned i = 0; i < chain_count.size(); ++i)
+        chain_count[i] = c.read_qce(0xa390 + i * 4);
+    restart();
+    c.cmac_keys(key128.data(), 16, 4, false, true, true);
+    for (unsigned i = 0; i < chain.size(); ++i) c.write_qce(0xa310 + i * 4, chain[i]);
+    for (unsigned i = 0; i < chain_count.size(); ++i)
+        c.write_qce(0xa390 + i * 4, chain_count[i]);
+    run(16, 4, "7d85449ea6ea19c823a7bf78837dfade");
+    // The engine reads the key at GO. A key write during the active request
+    // latches CFG_CHNG_ERR and must not change the tag.
+    restart();
+    c.cmac_keys(key256.data(), 32, 64, true, true, true);
+    c.write_qce(0xa120, 7);
+    for (unsigned i = 0; i < 4; ++i)
+        c.write_qce(0xd040 + i * 4, Consumer::reverse(key_group(key128.data(), i)));
+    assert(c.read_qce(0xa100) & 0x20000u);
+    c.ram.descriptor(ring1, 0, va_base + 0x5300, 128, 0xc0);
+    c.write_bam(0xd818, 8);
+    c.ram.descriptor(ring0, 0, va_base + 0x4400, 64, 0xc0);
+    c.write_bam(0xc818, 8);
+    sc_core::sc_start(1, sc_core::SC_NS);
+    c.ram.digest(digest_d, "e1992190549f6ed5696a2c056c315410", 16);
+    c.write_qce(0xa100, 0);
+    // The next request uses the replaced key.
+    restart();
+    c.cmac_keys(key128.data(), 16, 64, true, true, false);
+    run(0, 64, "51f0bebf7e3b9d92fc49741779363cfe");
+    // USE_HW_KEY needs the OEM key GO alias. The OEM alias needs USE_HW_KEY.
     assert(!(c.read_qce(0xa104) & 0x80000000u));
     c.cmac(16, true);
     c.write_qce(0xa120, 7);
@@ -505,6 +637,13 @@ int sc_main(int argc, char** argv) {
     c.write_qce(0xa104, 0);
     c.cmac(16, true, false);
     c.write_qce(0xc000, 7);
+    assert((c.read_qce(0xa100) & 1) && (c.read_qce(0xa104) & 0x80000000u));
+    c.write_qce(0xa100, 0);
+    c.write_qce(0xa104, 0);
+    // AUTH_KEY_SIZE names only AES-128 and AES-256.
+    c.cmac_keys(key128.data(), 16, 16, true, true, true);
+    c.write_qce(0xa300, 2u | (1u << 3) | (1u << 6) | (0xfu << 9) | 0x30000u);
+    c.write_qce(0xa120, 7);
     assert((c.read_qce(0xa100) & 1) && (c.read_qce(0xa104) & 0x80000000u));
     c.write_qce(0xa100, 0);
     c.write_qce(0xa104, 0);

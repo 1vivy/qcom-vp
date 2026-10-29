@@ -23,12 +23,12 @@
 namespace qcom_vp {
 
 // QCE 6.0 functional model. It keeps the GPCE startup controls and implements
-// SHA-1, SHA-256, SHA-384, SHA-512, and AES-256 CMAC with the OEM hardware key.
-// It retains hidden software key words but no request consumes them.
+// SHA-1, SHA-256, SHA-384, SHA-512, and AES CMAC with a supplied AUTH_KEY or
+// the OEM hardware key.
 //
 // MMIO offsets are relative to 01df0000. The QCE register block starts at
 // offset a000. The key bank is at d000 and holds 32 write-only words. Key
-// reads return zero, and no keyed operation uses the retained words.
+// reads return zero, and only AES CMAC reads the programmed AUTH_KEY words.
 // The BAM stream carries input on pipe 2n and the result dump on
 // pipe 2n+1, where n is CONFIG.PIPE_SET_SELECT.
 // The TPKEY receive path keeps the TME transport key and sets 01df1020 bit8.
@@ -146,7 +146,7 @@ protected:
                   << " total_slots=" << total_slot_count.get_value()
                   << " primary_destination=" << primary_destination.get_value()
                   << " secondary_destination=" << secondary_destination.get_value()
-                  << " sha=sha1-sha256-sha384-sha512 aes=cmac256-oem-hw-key engines=0x31"
+                  << " sha=sha1-sha256-sha384-sha512 aes=cmac128-cmac256-cmac256-oem-hw-key engines=0x31"
                      " keys=retained-hidden tpkey=cold-absent ciphers=unsupported\n";
     }
 
@@ -185,6 +185,7 @@ private:
     static constexpr std::uint32_t reg_auth_mac = 0x3a0;
     static constexpr std::uint32_t reg_config = 0x400;
     static constexpr std::uint32_t reg_key = 0x3000;
+    static constexpr std::uint32_t reg_auth_key = 0x3040;
     static constexpr std::uint32_t reg_key_last = 0x307c;
     // The key bank at physical 01dfd000 reaches this model at offset d000.
     // It holds the QCE key-register offsets 3000..307c.
@@ -215,7 +216,7 @@ private:
     // QSEE 156d239c tests bit 5 for its SHA-384 request. This profile implements
     // SHA-384 and SHA-512 behind that bit.
     // QSEE 156d2448 tests bit 0 (AES) before its RPMB key derivation. This profile
-    // implements only the AES-256 CMAC request with the OEM hardware key behind it.
+    // implements the AES CMAC request with a supplied or OEM hardware key.
     static constexpr std::uint32_t engines_available = (1u << 4) | (1u << 5) | (1u << 0);
     // QSEE 156d22a0 also tests the 21 low bits of 01dfa140 against a second
     // engine set. No selected source names those bits and this profile
@@ -295,6 +296,7 @@ private:
     static constexpr std::uint32_t auth_mode_cmac = 1;
     static constexpr std::uint32_t auth_key_size_shift = 3;
     static constexpr std::uint32_t auth_key_size_mask = 0x7;
+    static constexpr std::uint32_t auth_key_aes128 = 0;
     static constexpr std::uint32_t auth_key_aes256 = 2;
     static constexpr std::uint32_t auth_first_bit = 1u << 17;
     static constexpr std::uint32_t auth_size_aes_mac = 15;
@@ -321,7 +323,7 @@ private:
         return true;
     }
 
-    // aes_cmac is the keyed AES-256 CMAC request. The others are plain hashes.
+    // aes_cmac is keyed AES CMAC. The others are plain hashes.
     enum class HashAlg { none, sha1, sha256, sha384, sha512, aes_cmac };
     static bool sha512_family(HashAlg alg) {
         return alg == HashAlg::sha384 || alg == HashAlg::sha512;
@@ -376,7 +378,7 @@ private:
     std::array<std::uint32_t, 4> ccm_counters_{};
     std::uint32_t xts_du_ = 0;
     std::array<std::uint32_t, 4> cntr_masks_{};
-    // Raw guest words, retained only. No implemented request consumes keys or nonces.
+    // Key writes use the CONFIG byte lanes. Only AES CMAC reads these words.
     std::array<std::uint32_t, 32> key_words_{};
     std::array<std::uint32_t, 4> nonce_words_{};
     // GOPROC_OEM_KEY selects this key for the following request only.
@@ -401,7 +403,7 @@ private:
     SHA_CTX sha1_ctx_{};
     SHA256_CTX sha256_ctx_{};
     SHA512_CTX sha512_ctx_{};
-    // AES-256 CMAC state. The pending block stays unprocessed until more data
+    // AES CMAC state. The pending block stays unprocessed until more data
     // arrives, because only the last block of a final request takes a subkey.
     std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> aes_ctx_{
         EVP_CIPHER_CTX_new(), &EVP_CIPHER_CTX_free};
@@ -904,7 +906,11 @@ private:
             return true;
         }
         if (offset >= reg_key && offset <= reg_key_last && !(offset & 3)) {
-            key_words_[(offset - reg_key) / 4] = value;
+            // AUTH_KEY takes the same write-time CONFIG byte lanes as AUTH_IV.
+            // Linux programs big-endian key groups with bit9 clear and sets bit9
+            // only before GO. QSEE stores its little-endian caller words with
+            // bit9 set. The decode therefore uses the CONFIG value at the write.
+            key_words_[(offset - reg_key) / 4] = decode_field_word(value);
             return true;
         }
         return false;
@@ -1060,19 +1066,22 @@ private:
             schedule_ready();
     }
 
-    // Returns null when the request matches the selected RPMB key derivation:
-    // AES-256 CMAC with USE_HW_KEY through GOPROC_OEM_KEY and a 16-byte MAC.
+    // Supplied AUTH_KEY supports AES-128/256. The evidenced OEM path uses
+    // AES-256 with USE_HW_KEY through GOPROC_OEM_KEY. Both return 16-byte MACs.
     const char* cmac_request_error(std::uint32_t mode, std::uint32_t auth_size,
                                    std::uint32_t nonce_words) const {
         if (mode != auth_mode_cmac || nonce_words != 0 ||
             (auth_cfg_ & (auth_comp_exp_mac | auth_f9_direction | auth_pipe_key)))
             return "unsupported-aes-mode";
-        if (((auth_cfg_ >> auth_key_size_shift) & auth_key_size_mask) != auth_key_aes256)
+        const auto key_size = (auth_cfg_ >> auth_key_size_shift) & auth_key_size_mask;
+        if (key_size != auth_key_aes128 && key_size != auth_key_aes256)
             return "unsupported-aes-key-size";
-        // A software AUTH_KEY request has no selected consumer, so its key byte
-        // order is unknown. USE_HW_KEY needs the OEM key GO alias.
-        if (!(auth_cfg_ & auth_hw_key) || !oem_key_go_)
+        if (auth_cfg_ & auth_hw_key) {
+            if (!oem_key_go_) return "unsupported-aes-key-source";
+            if (key_size != auth_key_aes256) return "unsupported-aes-key-size";
+        } else if (oem_key_go_) {
             return "unsupported-aes-key-source";
+        }
         if (auth_size != auth_size_aes_mac) return "unsupported-aes-mac-size";
         return nullptr;
     }
@@ -1086,9 +1095,26 @@ private:
             for (unsigned i = 0; i < 4; ++i) store_be32(cmac_state_.data() + 4 * i, iv_words_[i]);
         }
         cmac_pending_length_ = 0;
-        return EVP_EncryptInit_ex(aes_ctx_.get(), EVP_aes_256_ecb(), nullptr,
-                   oem_hw_key_.data(), nullptr) == 1 &&
-            EVP_CIPHER_CTX_set_padding(aes_ctx_.get(), 0) == 1;
+        // GO captures the key before the stream supplies data.
+        // Register writes already decode their CONFIG byte lanes.
+        bool ok = false;
+        if (auth_cfg_ & auth_hw_key) {
+            ok = EVP_EncryptInit_ex(aes_ctx_.get(), EVP_aes_256_ecb(), nullptr,
+                     oem_hw_key_.data(), nullptr) == 1;
+        } else {
+            std::array<unsigned char, 32> supplied_key{};
+            const bool aes256 =
+                ((auth_cfg_ >> auth_key_size_shift) & auth_key_size_mask) == auth_key_aes256;
+            const unsigned words = aes256 ? 8 : 4;
+            for (unsigned i = 0; i < words; ++i)
+                store_be32(supplied_key.data() + 4 * i,
+                    key_words_[(reg_auth_key - reg_key) / 4 + i]);
+            ok = EVP_EncryptInit_ex(aes_ctx_.get(),
+                     aes256 ? EVP_aes_256_ecb() : EVP_aes_128_ecb(), nullptr,
+                     supplied_key.data(), nullptr) == 1;
+            OPENSSL_cleanse(supplied_key.data(), supplied_key.size());
+        }
+        return ok && EVP_CIPHER_CTX_set_padding(aes_ctx_.get(), 0) == 1;
     }
 
     bool aes_encrypt(const unsigned char* input, unsigned char* output) {

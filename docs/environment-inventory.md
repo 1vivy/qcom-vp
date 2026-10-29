@@ -72,7 +72,7 @@ The current environment contains functional state, but each research function ne
 | UFS media | OEM runs create fresh LUN copies. Stateful experiments declare and copy all persistent files together. | Device-specific records still need coherent contents and consumer checks. |
 | RPMB | Optional backing retains key, counter, and media across processes. Reset clears only pending responses. | Physical region allocation and OEM provisioning remain separate questions. |
 | Hardware keys and identity | Lua supplies explicit QCE and TME roots, geometry, and existing security policy inputs. | Captured sealed objects need compatible derivation, not only matching filenames. |
-| Secure files | Original local-table routines qualify constructed contents, restart, and tamper rejection in bounded instruction emulation. Native QBox execution also qualifies the derivation provider's constructor and its QCE root operation. | The secure-file derivation call, active version authority, and complete index and payload lifecycles remain unqualified. |
+| Secure files | Original local-table routines qualify constructed contents, restart, and tamper rejection in bounded instruction emulation. Native QBox execution also qualifies provider construction and three host-authored derivation calls. | Normal secure-file callers, active version authority, and complete index and payload lifecycles remain unqualified. |
 | RKP and trusted services | Published interfaces and firmware execution establish bounded availability. | Provisioning, certificate use, trusted-app persistence, StrongBox, and AVF need separate consumer experiments. |
 | EFI and boot policy | Package media and guest writes supply state. Private records distinguish EFI variables from Keymaster DeviceInfo. | Initialization, authoritative values, durable backing, and reset survival need distinct evidence. |
 | Shared handoffs | Firmware produces records in shared model memory. Existing physical captures identify selected structures and queue geometry. | A warm-state profile must preserve ownership and validity. Historical pointers and capabilities are not reset constants. |
@@ -179,10 +179,10 @@ It supplies neither a provider response nor derived material.
 | Dependency | Current classification | Required next evidence |
 | --- | --- | --- |
 | Derivation client layout | Original instructions and the public object ABI establish the request shape | A real secure-file call through the native provider |
-| Derivation algorithm and root | Native provider construction uses the virtual OEM key through QCE AES-256 CMAC | The cached-key operation and physical applicability |
+| Derivation algorithm and root | Native construction uses the virtual OEM key. Host-authored native calls match an independent KDF for cached, AES-128, and AES-256 keys | Normal secure-file callers and physical applicability |
 | Local version authority | Selected original routines accept coherent constructed contents across process restart | Complete index and payload lifecycles |
 | Phone authority selection | Existing records do not identify its active backend | An applicable trace or passive state observation |
-| Hardware root models | QBox execution connects UID `0x0b` construction to the existing QCE OEM-key path | Software-key CMAC for the next derivation stage and separate TME consumers |
+| Hardware root models | QBox connects UID `0x0b` construction to the QCE OEM-key path and its next derivation stage to supplied-key CMAC | Complete protected-file operations and separate TME consumers |
 
 The passive phone check observed a live `qseecomd`, existing logs, and its open descriptors.
 Those observations did not identify the active authority or derivation provider.
@@ -252,9 +252,9 @@ It establishes no connection between this provider and the separate TME root.
 Static dispatcher analysis resolves the null-key question for operation one.
 After initialization, a null key or zero key length selects the object's cached 32-byte key.
 The primitive then receives an explicit key, rather than the constructor's absent-key request.
-**Inference:** This next stage needs software-key CMAC through the selected driver.
-The current QCE model rejects software-key CMAC.
-The successful constructor therefore does not qualify secure-file derivation or remove that model gap.
+The [active native experiment](#native-supplied-key-derivation) exercises this stage through supplied-key CMAC.
+The model now supports that request.
+Constructor success alone still does not qualify secure-file derivation.
 
 The optional context helper opens UID `0x177`, opens subobject one, and requests property `id`.
 It appends the returned bytes only when the object's EL2-aware flag is nonzero.
@@ -321,6 +321,76 @@ Retained evidence:
 - Earlier observations: `artifacts:2026-10-29-live-secure-providers/manual-observations.json sha256=f1c0654e5ed07ac251ead8cc6d63e3cc1da8d0cdeb55635fc0e45ec2729dae2b`.
 - Replay instrument: `artifacts:2026-10-29-live-secure-providers/trace-provider.py sha256=f90b154be1d1eaa37a6d7e7656401b7625e1ced0c9134de3013af1d600e25ec9`.
 - Read-only transport: `artifacts:2026-10-29-live-secure-providers/observe.py sha256=50cd7ada1823093a54b9fb9f1e17707489dcba22d153dd4132459f8e0f182d2d`.
+
+### Native supplied-key derivation
+
+This experiment uses the same TZ image and declared virtual roots as the preceding provider trace.
+Original boot execution creates the UID `0x0b` object and initializes its cached key.
+The instrument then submits three host-authored calls to the original operation-one dispatcher.
+The original allocator supplies the request memory.
+The calls use a public label, a public context, and a 32-byte output buffer.
+
+This is an active virtual experiment, not passive observation of a stock caller.
+The instrument writes call arguments, the native entry PC, and the return address.
+It writes descriptors and public inputs into its allocated memory.
+It changes no firmware instruction, provider state, fuse policy, or provider result.
+The instrument reads the virtual cached key to calculate an independent expected result.
+No phone operation or physical-key capture occurs.
+
+Python `cryptography` calculates counter-mode AES CMAC independently from the QCE implementation.
+Each input contains a four-byte big-endian counter, the label, a zero separator, the context, and the requested bit length.
+The result comparison covers all 32 output bytes.
+
+| Native operation-one key input | Before the change | After the change |
+| --- | --- | --- |
+| Null input, selecting the cached key | Status one and `unsupported-aes-key-source` | Status zero and exact oracle match |
+| Explicit 16-byte key | Not exercised | Status zero and exact oracle match |
+| Explicit 32-byte key | Not exercised | Status zero and exact oracle match |
+
+The native driver writes CONFIG `0xe020e` before its AUTH_KEY words.
+Those words match little-endian loads from the supplied key.
+The initial AUTH_SEG_CFG value is `0x25e42` for AES-128 or `0x25e52` for AES-256.
+The driver writes GO value seven through plain GOPROC, not the OEM alias.
+The [model contract](../models/qcom/gpce/evidence.md#cmac-with-a-supplied-key) records the write-time byte lanes and GO-time key capture.
+
+Four boot attempts stopped before an active derivation call.
+Their watchdog failures do not qualify this path.
+The successful instrument removes the UEFI checkpoint and observes the native constructor directly after the verified secure bridge.
+The failed attempts remain in the private record.
+This result establishes neither deterministic boot nor the cause of those startup failures.
+
+Use the explicit input variables from the preceding procedure.
+The prepared firmware remains unchanged.
+The active instrument also requires Python `cryptography`.
+
+```sh
+EVIDENCE="${QCOM_VP_REF_ARTIFACTS:?}/2026-10-29-software-key-cmac"
+python3 "$EVIDENCE/active-provider.py" \
+  --prepared "$WORK/prepared" --tz "$TZ" \
+  --system "$SYSTEM" --platform "$SM8850_PLATFORM" \
+  --out "$WORK/active-observation"
+```
+
+The completed experiment reports:
+
+```text
+NATIVE_DERIVATION cached status=0 oracle=True
+NATIVE_DERIVATION supplied128 status=0 oracle=True
+NATIVE_DERIVATION supplied256 status=0 oracle=True
+EXPERIMENT_MODE active-virtual-call original-provider no-provider-substitution
+```
+
+The instrument stops its private VM after the calls.
+It does not resume the stock caller after changing the call state.
+This result qualifies the native derivation operation and its crypto dependency, not caller admission or a complete secure-file lifecycle.
+The active version authority, protected-file cipher operations, and physical compatibility remain separate questions.
+
+Retained evidence:
+
+- Failing native call: `artifacts:2026-10-29-software-key-cmac/before.json sha256=d8abfc64aeff4f1c6aeb158ec777a3d382ecb6755934d1762e526fac6a4e5441`.
+- Passing native calls: `artifacts:2026-10-29-software-key-cmac/final.json sha256=cbbc623813267d9459b71bbcebef6de17af5edff9ebaac3c0134ff1ab0b7c1dc`.
+- Active instrument: `artifacts:2026-10-29-software-key-cmac/active-provider.py sha256=9161641fe600c31293ffa3ff6e7e22e9a08fb397432b57fd3b5dda5026febc87`.
+- Startup limits: `artifacts:2026-10-29-software-key-cmac/prerequisite-failures.json sha256=f02d7355c403c3f8b8dbc9ebd6dece0abe3c8c1e5758cff6156cb4cd745449ea`.
 
 ## Hidden dependencies and disposition
 

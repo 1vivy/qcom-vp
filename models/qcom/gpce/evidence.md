@@ -155,14 +155,14 @@ The table below uses the QCE key-register offsets that the bank carries.
 
 | Offset | Register | Model behavior |
 | --- | --- | --- |
-| 3000..301c | ENCR_KEY0..7 | Retained as raw guest words. Reads return zero. |
+| 3000..301c | ENCR_KEY0..7 | Retained with write-time CONFIG byte lanes. Reads return zero. |
 | 3020..303c | ENCR_XTS_KEY0..7 | Same retention. Reads return zero. |
-| 3040..307c | AUTH_KEY0..15 | Same retention. Reads return zero. |
+| 3040..307c | AUTH_KEY0..15 | Same retention. Supplied-key CMAC consumes four or eight words. Reads return zero. |
 
 Reads of the key bank return zero.
 That value is an explicit model limitation, not a recovered silicon value.
 The model never returns retained key material.
-No hash, HMAC, CMAC, or cipher path reads these words.
+Supplied-key CMAC reads AUTH_KEY words. Plain hashes and unsupported keyed modes do not consume them.
 
 The model accepts the private zero writes that QSEE performs at offsets `11c`, `124`, `128`, and `13c`.
 It retains only the zero value and rejects any other value.
@@ -211,7 +211,7 @@ Linux `regs-v5.h` names the whole bank:
 `AUTH_KEY0..15` at `3040..307c`, and nonce words at `350..35c`.
 The physical bank is `01dfd000..01dfd07f`.
 
-The model retains all 32 raw words and the four nonce words.
+The model retains 32 key words with write-time CONFIG byte lanes and four raw nonce words.
 It accepts these writes before GO.
 Plain SHA reads neither the keys nor the nonces.
 Key reads return zero as an explicit limitation.
@@ -219,10 +219,9 @@ The model makes no claim about the silicon readback of a key register.
 The nonce words read back as programmed.
 No captured read establishes that value, so it is a model choice that gives the state a consistent view.
 
-Only the OEM-key AES-256 CMAC request below uses a key.
-Any other keyed request remains unsupported.
-A nonzero `AUTH_NONCE_NUM_WORDS`, an HMAC mode, a cipher configuration,
-a pipe key flag, or a software AES key still rejects the request.
+CMAC accepts the virtual OEM key or a supplied AES-128 or AES-256 key.
+Other keyed modes remain unsupported.
+A nonzero `AUTH_NONCE_NUM_WORDS`, an HMAC mode, a cipher configuration, or a pipe key flag still rejects the request.
 Retained key words alone never create a MAC or a cipher result.
 
 ### AES-256 CMAC with the OEM hardware key
@@ -253,7 +252,7 @@ The request had these fields:
 
 QSEE also wrote `AUTH_KEY0..15`, but USE_HW_KEY_AUTH selects the hardware key.
 
-The model accepts this request shape only.
+The OEM-key path accepts this request shape.
 AUTH_FIRST starts the CMAC chain at zero.
 A request without AUTH_FIRST loads the chain from `AUTH_IV0..3`.
 A nonfinal request encrypts each block into the chain and publishes the CBC-MAC state.
@@ -265,16 +264,16 @@ The OEM hardware key comes from secure fuses on silicon.
 No capture provides it, and the model never reads a guest key word for it.
 The default virtual OEM key is the SHA-256 digest of the public label
 `qcom-vp virtual GPCE OEM hardware key v1`.
-Each run starts with an unprogrammed RPMB, so no device key must match it.
+Fresh RPMB state has no key. Retained RPMB state must match its configured identity.
 
 The model rejects the plain GOPROC with USE_HW_KEY_AUTH set.
-It also rejects a CMAC request without USE_HW_KEY_AUTH.
-The software AES key has no selected consumer, so its key byte order is unknown.
+The OEM alias also requires USE_HW_KEY_AUTH.
+The supplied-key path uses plain GOPROC with USE_HW_KEY_AUTH clear.
 GOPROC_QC_KEY has no selected consumer and stays unmapped.
 
 The `qce-bam` fixture checks a nonfinal block, a final partial block, and a final full block.
 Python `cryptography` computes the expected values with the same virtual key.
-The fixture also checks both rejections.
+The fixture also checks both invalid key-source combinations.
 
 ### Virtual OEM key input
 
@@ -297,7 +296,42 @@ The profile does not export phone identity by default or prove compatibility wit
 
 The [native provider trace](../../../docs/environment-inventory.md#native-provider-and-hardware-dependency) connects UID `0x0b` construction to this existing path.
 It does not qualify the secure-file operation that uses the resulting cached key.
-Software-key CMAC remains unsupported.
+The separate [active experiment](../../../docs/environment-inventory.md#native-supplied-key-derivation) exercises operation one on the native object.
+
+### CMAC with a supplied key
+
+The model accepts AES-128 and AES-256 keys through `AUTH_KEY0..3` and `AUTH_KEY0..7`, respectively.
+AUTH_KEY_SIZE values zero and two select those sizes.
+AUTH_SIZE must select a 16-byte MAC, and AUTH_MODE must select CMAC.
+Plain GOPROC starts the request with USE_HW_KEY_AUTH clear.
+The OEM alias, pipe keys, other sizes, and other AES modes remain rejected for this path.
+
+The key words use the CONFIG byte lanes at each write, not the lanes at GO.
+With bit nine clear, each register word holds a big-endian key group.
+With bit nine set, the writer supplies the reversed word.
+GO captures the decoded key in the AES schedule before the stream supplies data.
+An attempted key write during an active request sets CFG_CHNG_ERR without changing that request.
+The temporary key buffer uses stack storage, and the model clears it after schedule initialization.
+
+Linux `qce_setup_regs_ahash` establishes the first programming form.
+It writes big-endian key groups before it sets CONFIG bit nine for GO.
+The source is [Linux v6.18 common.c](https://github.com/torvalds/linux/blob/7d0a66e4bb9081d75c82ec4957c50034cb0ea449/drivers/crypto/qce/common.c).
+The [register definitions](https://github.com/torvalds/linux/blob/7d0a66e4bb9081d75c82ec4957c50034cb0ea449/drivers/crypto/qce/regs-v5.h) identify both key sizes, CMAC mode, key registers, and CONFIG bit nine.
+These sources establish the register contract, not physical qualification of SM8850.
+
+The `qce-bam` fixture checks the following boundaries:
+
+1. The vectors cover both key sizes and include empty, complete, and partial messages.
+2. Big-endian key writes remain valid when CONFIG changes before GO.
+3. Little-endian writes produce the expected MAC.
+4. A saved CBC-MAC chain and byte count continue across separate segments.
+5. A key write during an active request cannot change its result.
+6. A later request uses its newly supplied key.
+7. Invalid key-source combinations and the unsupported size encoding fail.
+
+RFC 4493 and NIST SP 800-38B supply the standard vectors.
+Python `cryptography` independently checks the partial message and the intermediate CBC-MAC chain.
+The existing OEM-key profile test also passes without a change to its expected values.
 
 ### IV and byte-count byte order
 
@@ -446,7 +480,7 @@ It publishes no digest and no result dump.
 | --- | --- |
 | AUTH_ALG not SHA or AES | KASUMI, SNOW3G, and ZUC are not implemented |
 | AUTH_MODE not hash for SHA | HMAC needs a key and is not implemented |
-| AES other than OEM-key AES-256 CMAC | Software keys, other key sizes, and CCM have no selected consumer |
+| Unsupported AES mode, key size, or source | Only supplied-key AES-128/256 CMAC and OEM-key AES-256 CMAC have qualified consumers |
 | AUTH_SIZE above 3 for SHA | No selected source names another size |
 | Pipe key flag, or HW key flag on SHA | Pipe and hardware keys apply only to the OEM-key CMAC |
 | Expected-MAC or F9 bit | Authenticated decrypt is not implemented |
@@ -476,7 +510,7 @@ A program error is visible to the firmware and does not become a false success.
 - The block size is 64 bytes for both algorithms.
 - The result dump is 128 bytes.
 - The model retains 32 key words and four nonce words.
-- Key reads return zero, and no operation consumes a retained key word.
+- Key reads return zero. Supplied-key CMAC consumes four or eight retained AUTH_KEY words.
 - The OEM-key CMAC uses the virtual OEM key. No MMIO path exposes it.
 - The model uses fixed stack and member buffers only.
 
@@ -501,7 +535,7 @@ The helper declares eight first-bank slots and sixteen total slots.
 It declares destination selectors independently from TME identifiers.
 Numeric equality between destination eight and TME source eight establishes no identity or authority.
 The model retains the written key and nonce words and never exposes key material.
-It contains no key export handler. Its only keyed mode is the OEM-key AES-256 CMAC.
+It contains no key export handler. CMAC supports supplied AES-128/256 keys and the virtual OEM key.
 The separate authenticated import path stores a key but enables no keyed operation.
 The constructor reports the cold virtual policy and the implemented hash engines.
 Unimplemented status words remain errors.
@@ -761,7 +795,7 @@ The same path shifts `ctx+49` into AUTH_KEY_SIZE bits 5:3.
 The model reports bits 0, 4, and 5 at `01dfa108`.
 Bit 0 is `CRYPTO_ENCR_AES_SEL`, bit 4 is `CRYPTO_SHA_SEL`, and bit 5 is `CRYPTO_SHA512_SEL`.
 Bits 4 and 5 match the implemented SHA-1, SHA-256, SHA-384, and SHA-512 paths.
-Bit 0 matches the OEM-key AES-256 CMAC path. Other AES requests fail with a logged rejection.
+Bit zero matches the supplied-key AES-128/256 and OEM-key AES-256 CMAC paths. Other AES requests fail with a logged rejection.
 The operation start rejects any SHA AUTH_SIZE above 3.
 The model reports zero at `01dfa140`.
 The firmware therefore denies algorithms 8, 14, and 15 to 24.

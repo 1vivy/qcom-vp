@@ -292,8 +292,9 @@ Their existing public roots remain the defaults.
 
 The [native provider trace](environment-inventory.md#native-provider-and-hardware-dependency) identifies the registered UID `0x0b` factory and constructor.
 Original firmware derives its initial key through the existing QCE OEM-key path.
-The trace does not qualify secure-file operation one or identify the phone's active version authority.
-Those dependencies remain explicit instead of receiving invented replies.
+A separate [active experiment](environment-inventory.md#native-supplied-key-derivation) exercises operation one with cached and supplied keys through the original provider.
+Its results match an independent KDF, without a provider substitute.
+Caller admission, complete secure-file operations, and the phone's active version authority remain separate qualifications.
 
 
 ### B4. Qualify the reworked environments

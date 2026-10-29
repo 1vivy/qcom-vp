@@ -197,7 +197,8 @@ Existing fuse and trust inputs continue to select those policies.
 
 The [native provider trace](environment-inventory.md#native-provider-and-hardware-dependency) connects UID `0x0b` construction to the QCE OEM-key path.
 The constructor binds its derived key to a firmware environment identity.
-This result does not qualify the complete secure-file derivation or connect that provider to the TME root.
+The [active experiment](environment-inventory.md#native-supplied-key-derivation) also checks derivation with cached and supplied keys.
+These results do not qualify a complete secure-file lifecycle or connect that provider to the TME root.
 An explicit value needs provenance. Its presence alone proves neither a physical derivation nor compatibility with device-bound contents.
 The default roots remain public test material.
 
