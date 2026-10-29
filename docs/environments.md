@@ -195,8 +195,9 @@ A nonempty TME root requires the existing `virtual_key_substitute=true` selectio
 Explicit roots do not change image authentication or authorization policy.
 Existing fuse and trust inputs continue to select those policies.
 
-These roots do not establish the source of secure-file service `0x0b` keys.
-That provider remains a separate firmware dependency.
+The [native provider trace](environment-inventory.md#native-provider-and-hardware-dependency) connects UID `0x0b` construction to the QCE OEM-key path.
+The constructor binds its derived key to a firmware environment identity.
+This result does not qualify the complete secure-file derivation or connect that provider to the TME root.
 An explicit value needs provenance. Its presence alone proves neither a physical derivation nor compatibility with device-bound contents.
 The default roots remain public test material.
 

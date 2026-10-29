@@ -290,9 +290,10 @@ A new identity requires fresh state instead of incompatible protected objects.
 QCE and TME accept explicit roots through existing Lua composition.
 Their existing public roots remain the defaults.
 
-The implementation retains the open provider question rather than inventing a hardware dependency.
-The trace establishes the client request, but its registered provider and root source remain unidentified.
-The [inventory](environment-inventory.md#stateful-local-authority-and-derivation-boundary) records the observations, side effects, and remaining qualification.
+The [native provider trace](environment-inventory.md#native-provider-and-hardware-dependency) identifies the registered UID `0x0b` factory and constructor.
+Original firmware derives its initial key through the existing QCE OEM-key path.
+The trace does not qualify secure-file operation one or identify the phone's active version authority.
+Those dependencies remain explicit instead of receiving invented replies.
 
 
 ### B4. Qualify the reworked environments

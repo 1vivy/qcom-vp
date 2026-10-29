@@ -295,6 +295,10 @@ Both values enter the virtual model.
 The default value is public test material. An explicit value needs its own provenance.
 The profile does not export phone identity by default or prove compatibility with captured sealed objects.
 
+The [native provider trace](../../../docs/environment-inventory.md#native-provider-and-hardware-dependency) connects UID `0x0b` construction to this existing path.
+It does not qualify the secure-file operation that uses the resulting cached key.
+Software-key CMAC remains unsupported.
+
 ### IV and byte-count byte order
 
 QSEE `156c68e4` programs engine type 2 through `156d2824` with these SHA-256 IV words:

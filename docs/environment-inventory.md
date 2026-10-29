@@ -72,7 +72,7 @@ The current environment contains functional state, but each research function ne
 | UFS media | OEM runs create fresh LUN copies. Stateful experiments declare and copy all persistent files together. | Device-specific records still need coherent contents and consumer checks. |
 | RPMB | Optional backing retains key, counter, and media across processes. Reset clears only pending responses. | Physical region allocation and OEM provisioning remain separate questions. |
 | Hardware keys and identity | Lua supplies explicit QCE and TME roots, geometry, and existing security policy inputs. | Captured sealed objects need compatible derivation, not only matching filenames. |
-| Secure files | Original local-table routines qualify constructed contents, restart, and tamper rejection in bounded instruction emulation. | The real derivation provider and complete index and payload lifecycles remain unqualified. |
+| Secure files | Original local-table routines qualify constructed contents, restart, and tamper rejection in bounded instruction emulation. Native QBox execution also qualifies the derivation provider's constructor and its QCE root operation. | The secure-file derivation call, active version authority, and complete index and payload lifecycles remain unqualified. |
 | RKP and trusted services | Published interfaces and firmware execution establish bounded availability. | Provisioning, certificate use, trusted-app persistence, StrongBox, and AVF need separate consumer experiments. |
 | EFI and boot policy | Package media and guest writes supply state. Private records distinguish EFI variables from Keymaster DeviceInfo. | Initialization, authoritative values, durable backing, and reset survival need distinct evidence. |
 | Shared handoffs | Firmware produces records in shared model memory. Existing physical captures identify selected structures and queue geometry. | A warm-state profile must preserve ownership and validity. Historical pointers and capabilities are not reset constants. |
@@ -119,7 +119,8 @@ The version service can select a counter object, an RPMB table, or a protected `
 The captured `vTable` entries match the index identities but contain different versions.
 They therefore do not establish the active authority for those indexes.
 The key wrapper delegates derivation through service `0x0b`.
-This investigation does not establish the root-key provider or recover physical keys.
+The [native provider trace](#native-provider-and-hardware-dependency) identifies its constructor and QCE dependency in a different TZ image.
+Neither investigation recovers physical keys.
 
 Original firmware instructions executed in twelve bounded offline scenarios.
 The experiment supplies constructed initialization state, a public test key, real HMAC-SHA256 operations, and an in-memory filesystem.
@@ -177,11 +178,11 @@ It supplies neither a provider response nor derived material.
 
 | Dependency | Current classification | Required next evidence |
 | --- | --- | --- |
-| Derivation client layout | Original instructions and the public object ABI establish the request shape | Provider registration and execution |
-| Derivation algorithm and root | Unknown behind the service boundary | Applicable provider code or an execution trace |
+| Derivation client layout | Original instructions and the public object ABI establish the request shape | A real secure-file call through the native provider |
+| Derivation algorithm and root | Native provider construction uses the virtual OEM key through QCE AES-256 CMAC | The cached-key operation and physical applicability |
 | Local version authority | Selected original routines accept coherent constructed contents across process restart | Complete index and payload lifecycles |
 | Phone authority selection | Existing records do not identify its active backend | An applicable trace or passive state observation |
-| Hardware root models | Explicit QCE and TME profile inputs control their existing virtual algorithms | A demonstrated connection to the secure-file provider |
+| Hardware root models | QBox execution connects UID `0x0b` construction to the existing QCE OEM-key path | Software-key CMAC for the next derivation stage and separate TME consumers |
 
 The passive phone check observed a live `qseecomd`, existing logs, and its open descriptors.
 Those observations did not identify the active authority or derivation provider.
@@ -196,6 +197,130 @@ Retained evidence:
 - Derivation dispatch: `artifacts:2026-10-29-secure-state-dependencies/derivation-request.json sha256=dada58ecc9d2408ab2a787920869f55678fc3b8c6a2aad4d8647b5f6644a83fe`.
 - Dispatch instrument: `artifacts:2026-10-29-secure-state-dependencies/derivation-request.py sha256=7b364ed8db9344e78c5eabb544d7181518fb8c428ae1536e88a5fbe6ce91d590`.
 - Passive device check: `artifacts:2026-10-29-secure-state-device/findings.json sha256=fa479e2a79eb7f7d4fdca2b63365b284f87c760bee2cd994813fc6e71b190108`.
+
+### Native provider and hardware dependency
+
+QBox executes the registered provider from the CPH2749 package's `IMAGES/tz.mbn`.
+Its SHA-256 is `afdfaf27b33616718249ac857b7021001f33fe767c74c6e877cd280a3ee99932`.
+The earlier phone-matched image has SHA-256 `f6317e33e3daf280d39a7912bb103e8a8840e0130e6ff1a4b158920e5e7e3fa2`.
+These images differ. The runtime result applies to the first image and the declared virtual profile.
+
+The observer uses hardware breakpoints and the existing simulation-time hold.
+It reads registers, object metadata, and selected command fields.
+It changes no guest register, guest memory, firmware instruction, or authentication result.
+It reads no key bytes or identity bytes.
+The existing reconstructed TME runtime remains an explicit input, not a newly recovered retail runtime.
+
+The service lookup first searches a local cache.
+On a cache miss, it invokes the environment opener through the real object syscall.
+The native opener applies its permissions and searches registered factories.
+The observed factory advertises both UID `0x0b` and UID `0x91`.
+The commonlib cache insertion routine is not the native factory registry.
+
+| Site in the selected ELF | Role | Evidence |
+| --- | --- | --- |
+| `0xd864d97c` | Commonlib lookup with opener fallback | Original instructions and live object dispatch |
+| `0x156f390c` | Native environment opener | Live callback and registry inspection |
+| `0x156962dc` | Registered factory | Live UID masks and constructor table |
+| `0x157a8278` | UID `0x0b` constructor | Native entry and successful return |
+| `0x157a8748` | Derivation service dispatcher | Original instructions and native release operation |
+| `0x156b7978`, `0x156b76c4` | KDF policy and primitive | Native calls and selected policy value |
+| `0x157a5034` | UID `0x91` enablement selector | Original instructions only |
+
+ASLR changes both kernel and commonlib addresses between runs.
+The observer derives both relocations from real transitions and checks 64 instruction bytes before it installs each fixed observation site.
+An address from a previous run is not a reusable runtime address.
+
+The UID `0x0b` constructor queries a 32-byte environment property named `did`.
+Its fallback queries `vm` and uses a different label.
+The observed constructor selects the label `core trustzone application key label securemsm`.
+It supplies no initial key and requests 32 output bytes.
+Its KDF policy flag is zero, so this instance does not select the preliminary hash branch.
+
+The selected KDF executes a counter-mode MAC with a four-byte counter.
+The observer follows its native MAC callback into the QCE driver.
+Genuine command elements contain `AUTH_SEG_CFG=0x45e52`, a 16-byte segment, and GO value seven through `GOPROC_OEM_KEY`.
+Those fields select AES-256 CMAC with `USE_HW_KEY_AUTH`.
+Both the KDF and constructor return zero.
+The returned object records an initialized key and an EL2-aware flag of zero.
+
+The [QCE model](../models/qcom/gpce/evidence.md#aes-256-cmac-with-the-oem-hardware-key) supplies its explicit virtual OEM key.
+This establishes the constructor's hardware dependency in this environment.
+It does not establish the physical key value, physical derivation equivalence, or compatibility with captured secure files.
+It establishes no connection between this provider and the separate TME root.
+
+Static dispatcher analysis resolves the null-key question for operation one.
+After initialization, a null key or zero key length selects the object's cached 32-byte key.
+The primitive then receives an explicit key, rather than the constructor's absent-key request.
+**Inference:** This next stage needs software-key CMAC through the selected driver.
+The current QCE model rejects software-key CMAC.
+The successful constructor therefore does not qualify secure-file derivation or remove that model gap.
+
+The optional context helper opens UID `0x177`, opens subobject one, and requests property `id`.
+It appends the returned bytes only when the object's EL2-aware flag is nonzero.
+The observed flag is zero, so this trace does not exercise that service.
+Its existence alone establishes no DICE, BCC, RKP, or physical identity contract.
+
+Static analysis also identifies the native enablement policy:
+
+1. The selector resolves policy from a valid 32-byte `did` property.
+2. A successful `cmnlib_gppo_rpmb_enablement` query with a zero final word disables the feature.
+3. Otherwise, secure-state bits satisfying `(state & 0x67) == 0x40` enable it.
+4. Other states require the UID `0x171` dependency. Its success enables the feature, while its special `0x0b` result selects fallback status ten.
+
+The counter object comes through UID `0x91` and uses cache key `0x8b`.
+That cache key is not an independently advertised service in the observed registry.
+The commonlib client still selects between its counter object, RPMB table, and protected local table.
+The static policy does not identify the phone's active authority.
+
+The armed sites report no authority call before the execution boundary.
+The complete earlier trace contains the known-present key constructor as a positive control.
+The retained provider traces stop at an unmodeled read of `0x17810008`, before an Android secure-file consumer runs.
+The next authority observation needs a real permitted caller, not a supplied service reply or a constructed local-table state.
+The provider's observed dispatch operation is release, not secure-file operation one.
+
+The retained record and instrument remain private research evidence.
+They are not prerequisites for a public build or an authored environment.
+
+1. Set `FIRMWARE` to the explicit input manifest.
+2. Set `TZ` to the selected extracted image and `WORK` to a new research directory.
+3. Set `SYSTEM` and `SM8850_PLATFORM` to the installed executable and platform file.
+4. Bind `EVIDENCE` to this record in the configured artifact store.
+5. Prepare the inputs and execute the observer.
+
+```sh
+EVIDENCE="${QCOM_VP_REF_ARTIFACTS:?}/2026-10-29-live-secure-providers"
+mkdir -p "$WORK"
+qcom-vp prepare --firmware "$FIRMWARE" --out "$WORK/prepared"
+python3 "$EVIDENCE/trace-provider.py" \
+  --prepared "$WORK/prepared" --tz "$TZ" \
+  --system "$SYSTEM" --platform "$SM8850_PLATFORM" \
+  --out "$WORK/observation"
+```
+
+The observer requires Python with `pyelftools`. The exercised version is `0.33`.
+The manifest preserves the retail profile and its declared TME reconstruction.
+The observer creates fresh LUN copies and fresh RPMB state.
+It does not resume captured phone storage.
+
+The complete replay reports:
+
+```text
+NATIVE_PROVIDER uid=0x0b root_status=0 constructor_status=0 initialized=1
+NATIVE_QCE oem_key_go=1 hardware_key_auth=1
+AUTHORITY_OBSERVATIONS count=0
+```
+
+The native system still reports `RUN_FAILED reason=unmodeled-access`.
+That result limits the observation. It is not a successful secure-file lifecycle or a complete boot.
+
+Retained evidence:
+
+- Native replay: `artifacts:2026-10-29-live-secure-providers/observation.json sha256=12b5250a05a4d94197fe3d05c729b40ac9daf2d8c88df5c505300733f3dee5fe`.
+- Registry and opener: `artifacts:2026-10-29-live-secure-providers/registry.json sha256=87cfedf902943126ee6edc925b7419921149865ac4c3917ea1577a7a4cd2a216`.
+- Earlier observations: `artifacts:2026-10-29-live-secure-providers/manual-observations.json sha256=f1c0654e5ed07ac251ead8cc6d63e3cc1da8d0cdeb55635fc0e45ec2729dae2b`.
+- Replay instrument: `artifacts:2026-10-29-live-secure-providers/trace-provider.py sha256=f90b154be1d1eaa37a6d7e7656401b7625e1ced0c9134de3013af1d600e25ec9`.
+- Read-only transport: `artifacts:2026-10-29-live-secure-providers/observe.py sha256=50cd7ada1823093a54b9fb9f1e17707489dcba22d153dd4132459f8e0f182d2d`.
 
 ## Hidden dependencies and disposition
 
