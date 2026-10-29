@@ -94,11 +94,111 @@ Lua receives these environment variables:
 | --- | --- |
 | `QCOM_VP_ENV_ROOT` | Absolute path to the copied inputs |
 | `QCOM_VP_RUN_ROOT` | Absolute path to the run output |
+| `QCOM_VP_STATE_ROOT` | Absolute path to declared mutable state, when the environment declares state |
 
 Lua should resolve input files from `QCOM_VP_ENV_ROOT` and write logs under `QCOM_VP_RUN_ROOT`.
 Use `bin_file_offset` and `bin_file_size` to select bytes from a dump.
 Use memory addresses and CPU reset parameters to define their place in the machine.
 Those are different coordinates. A file offset never establishes a reset address.
+
+### Persistent state
+
+Optional `[[state]]` entries declare the complete collection of persistent files.
+Each entry has a relative `name` and an optional `seed`.
+The seed names an immutable file from `[[files]]`, not an arbitrary host path.
+Without a seed, the file does not exist initially. Its component must initialize it through the declared behavior.
+
+```toml
+[[state]]
+name = "lun0.img"
+seed = "initial-lun0.img"
+
+[[state]]
+name = "rpmb.bin"
+```
+
+The manifest must also declare and hash `initial-lun0.img` in `[[files]]`.
+Lua selects mutable paths under `QCOM_VP_STATE_ROOT`.
+For example, the UFS parameter `rpmb_state_file` selects `QCOM_VP_STATE_ROOT .. '/rpmb.bin'`.
+The component owns the file format and checks its contents.
+The launcher does not interpret or invent provisioned records.
+Stateful output directories use owner-only access because profiles and state can contain private virtual keys.
+
+Stateful environments treat every file under `inputs/` as immutable.
+The launcher checks those hashes after the process stops.
+It records initial and final identities for every declared state file, including absence.
+It rejects undeclared files, symbolic links, and nonregular files under the state directory.
+A changed input or incomplete inventory prevents a final state record.
+
+### Fresh, resume, and clone
+
+| Choice | Initial persistent state | Identity |
+| --- | --- | --- |
+| No continuation option | Declared seeds, with unseeded files absent | The declared profile |
+| `--resume-from RUN` | Complete final state copied from `RUN` | Preserved |
+| `--clone-from RUN` | Complete final state copied from `RUN` | Preserved |
+| New identity | A new profile with fresh seeds | Explicitly changed |
+
+Both continuation options require a new output directory and preserve the source run.
+Resume declares a continuation. Clone declares an independent branch with the same initial identity.
+Neither option resumes processor execution or restores volatile state.
+The composition still establishes its declared entry condition.
+
+```sh
+qcom-vp experiment --environment "$WORK/environment.toml" \
+  --out "$WORK/fresh" --system build/install/bin/qcom-vp-system
+qcom-vp experiment --environment "$WORK/environment.toml" \
+  --resume-from "$WORK/fresh" --out "$WORK/resumed" \
+  --system build/install/bin/qcom-vp-system
+qcom-vp experiment --environment "$WORK/environment.toml" \
+  --clone-from "$WORK/fresh" --out "$WORK/cloned" \
+  --system build/install/bin/qcom-vp-system
+```
+
+Continuation requires the same manifest hash and system executable hash.
+The launcher checks the source state against its final record before and after copying.
+It also checks the copied state.
+A modified profile, missing file, changed counter file, or incomplete result prevents execution.
+All dependent media, protected files, counters, and provisioning records belong in the same declaration.
+
+To initialize another identity, prepare a new profile and start without a continuation option.
+Do not combine new root material with copied objects that depend on the previous identity.
+The launcher deliberately provides no option to ignore that mismatch.
+
+A final record identifies every declared state file after the process stops.
+It does not mean that a guest transaction completed or that the files form a valid application state.
+A failed guest can leave state that requires firmware recovery.
+The experiment checker must qualify that recovery separately.
+Do not change or run the source collection while copying it.
+
+The OEM `run` command still creates fresh LUN copies and fresh RPMB state.
+Its `rpmb.state` file retains the RPMB result for that run.
+Use a declared experiment for complete persistent-state continuation.
+
+### Explicit identity inputs
+
+Keep the profile in a declared immutable Lua file.
+The shared `platforms/qcom/sm88xx/security-roots.lua` helper applies its fields to existing component instances.
+Both SoC wrappers accept those fields in their options.
+The OEM launcher obtains them from its hashed board file.
+
+| Input | Owner and effect | Empty or absent value |
+| --- | --- | --- |
+| `oem_hw_key_hex` | QCE uses exactly 32 bytes for OEM-key AES-256 CMAC | Existing public-label derivation |
+| `virtual_root_hex` | TME uses exactly 48 bytes for its virtual managed-key derivation | Existing public-label derivation |
+| `rpmb_size_kib` | UFS declares region geometry in multiples of 128 KiB | Shared reset composition uses 4096 KiB |
+| `rpmb_state_file` | UFS retains the programmed key, counter, and media in a local file | State lasts only within the process |
+
+Root strings contain hexadecimal characters without a prefix or whitespace.
+The models reject invalid lengths and characters before simulation.
+A nonempty TME root requires the existing `virtual_key_substitute=true` selection.
+Explicit roots do not change image authentication or authorization policy.
+Existing fuse and trust inputs continue to select those policies.
+
+These roots do not establish the source of secure-file service `0x0b` keys.
+That provider remains a separate firmware dependency.
+An explicit value needs provenance. Its presence alone proves neither a physical derivation nor compatibility with device-bound contents.
+The default roots remain public test material.
 
 ## Trust and reproducibility boundaries
 
@@ -110,8 +210,9 @@ Never run an untrusted composition merely because its hashes match.
 The system executable hash does not identify every shared library or host dependency.
 Record the checkout revision and dependency pins with the experiment procedure.
 Record toolchain versions when generated guest bytes depend on them.
-The run executes copied storage rather than the original input when Lua follows the declared path contract.
-Run state can change after execution starts. The recorded input hashes describe its initial bytes.
+Stateless experiments can use copied storage under `inputs/`.
+Stateful experiments use immutable inputs and separate files under `state/`.
+The recorded input hashes describe initial bytes. Final state identities describe bytes after the process stops.
 
 The experiment command does not apply the OEM artifact-retention policy.
 Retain evidence that supports active claims before removing your own experiment output.

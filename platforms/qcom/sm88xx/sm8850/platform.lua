@@ -7,5 +7,6 @@ return function(options)
     if options.tme_runtime_api_map then
         dofile(directory .. 'runtime.lua')(platform, options)
     end
+    dofile(directory .. '../security-roots.lua')(platform, options)
     return platform
 end

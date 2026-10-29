@@ -69,10 +69,10 @@ The current environment contains functional state, but each research function ne
 
 | Surface | Current contract | Remaining qualification |
 | --- | --- | --- |
-| UFS media | Preparation imports package contents. Each run receives independent mutable LUN copies. | Device-specific records and intentional reuse of prior state need a coherent input profile. |
-| RPMB | The reference declares 4 MiB. The key, counter, and data persist within one run. Each new run begins unprogrammed. | Provisioned contents, region allocation, and persistence across runs remain separate requirements. |
-| Hardware keys and identity | The composition supplies explicit virtual identity, policy, and key substitutes. | Captured sealed objects need compatible derivation inputs and validation, not only matching filenames. |
-| Secure files | Selected firmware uses filesystem listeners and protected persistent objects. | The object format, version relationships, integrity checks, and owning service need qualification together. |
+| UFS media | OEM runs create fresh LUN copies. Stateful experiments declare and copy all persistent files together. | Device-specific records still need coherent contents and consumer checks. |
+| RPMB | Optional backing retains key, counter, and media across processes. Reset clears only pending responses. | Physical region allocation and OEM provisioning remain separate questions. |
+| Hardware keys and identity | Lua supplies explicit QCE and TME roots, geometry, and existing security policy inputs. | Captured sealed objects need compatible derivation, not only matching filenames. |
+| Secure files | Original local-table routines qualify constructed contents, restart, and tamper rejection in bounded instruction emulation. | The real derivation provider and complete index and payload lifecycles remain unqualified. |
 | RKP and trusted services | Published interfaces and firmware execution establish bounded availability. | Provisioning, certificate use, trusted-app persistence, StrongBox, and AVF need separate consumer experiments. |
 | EFI and boot policy | Package media and guest writes supply state. Private records distinguish EFI variables from Keymaster DeviceInfo. | Initialization, authoritative values, durable backing, and reset survival need distinct evidence. |
 | Shared handoffs | Firmware produces records in shared model memory. Existing physical captures identify selected structures and queue geometry. | A warm-state profile must preserve ownership and validity. Historical pointers and capabilities are not reset constants. |
@@ -80,6 +80,9 @@ The current environment contains functional state, but each research function ne
 The [storage evidence](../models/qcom/ufs/README.md#authenticated-rpmb) defines the RPMB operations and their limits.
 The [substitute inventory](qcom/sm88xx/stubs.md) identifies virtual keys and identity.
 The [hardware evidence](qcom/sm88xx/oplus/infiniti/hardware-evidence.md#shared-ram) separates captured handoff contents from reset behavior.
+The [RPMB experiment](../environments/qcom/rpmb/README.md) qualifies fresh, resume, and clone behavior through an authored AArch64 guest.
+Its continuation checks authenticated counter and media reads, then rejects replayed, wrong-key, and changed frames without changing persistent bytes.
+The [state lifecycle](environments.md#persistent-state) binds the complete declared collection to its manifest and system executable.
 
 Selected CPH2747 captures establish useful structure without qualifying a complete provisioned environment.
 The RPMB unit reports 16 MiB, while its region allocation remains unresolved.
@@ -144,6 +147,56 @@ The retained artifacts identify the supplied boundaries and the unresolved depen
 - Execution instrument: `artifacts:2026-10-29-secure-file-protocol/execute-protocol.py sha256=2060522122b56b44169df5d7a8961c9e604b19822fa6845630ed9962246efc36`.
 - Capture decoder: `artifacts:2026-10-29-secure-file-protocol/decode-captures.py sha256=b8cf1273a75949f73491effad4c47357c4c70c9e58fe7f51a7254e2333a464fc`.
 
+### Stateful local authority and derivation boundary
+
+The [local-authority experiment](../environments/qcom/secure-storage/README.md) needs no captured secure files.
+It loads the matched TZ image from an explicit path and checks its complete hash.
+Its entry state supplies a test identity, an initialized test key, and a local-file authority.
+The host supplies HMAC-SHA-256 and durable file operations.
+
+Separate processes execute the original version-table routines:
+
+1. The firmware creates a 593-byte protected table.
+2. The firmware stores version 7.
+3. A new process reads version 7 from the retained table.
+4. The instrument changes one authenticated byte.
+5. Another process rejects the changed table with `0xf0100001` and removes its primary file.
+
+The backup remains. This experiment does not qualify backup recovery or general secure-file payloads.
+It uses bounded instruction emulation, not QBox execution.
+No RPMB operation or physical key provider supplies its result.
+
+A separate original-client trace reaches the derivation dispatch boundary.
+The client looks up UID `0x0b` and invokes operation one.
+Its four 16-byte argument descriptors contain buffer lengths 0, 33, 35, and 32.
+The first pointer is null.
+The `0x13` field encodes three input buffers and one output buffer, not a byte length.
+The permitted CLO `SmciInvokeUtils.h` defines the matching packed-count ABI.
+The trace stops before the instrument-supplied dispatch target returns a value.
+It supplies neither a provider response nor derived material.
+
+| Dependency | Current classification | Required next evidence |
+| --- | --- | --- |
+| Derivation client layout | Original instructions and the public object ABI establish the request shape | Provider registration and execution |
+| Derivation algorithm and root | Unknown behind the service boundary | Applicable provider code or an execution trace |
+| Local version authority | Selected original routines accept coherent constructed contents across process restart | Complete index and payload lifecycles |
+| Phone authority selection | Existing records do not identify its active backend | An applicable trace or passive state observation |
+| Hardware root models | Explicit QCE and TME profile inputs control their existing virtual algorithms | A demonstrated connection to the secure-file provider |
+
+The passive phone check observed a live `qseecomd`, existing logs, and its open descriptors.
+Those observations did not identify the active authority or derivation provider.
+The phone remained in Android with the same slot.
+The check issued no secure-service request, storage write, provisioning operation, reboot, or MMIO probe.
+Authorized private content research remains available when a bounded observation can resolve a specific dependency.
+
+Retained evidence:
+
+- Dependency trace: `artifacts:2026-10-29-secure-state-dependencies/findings.json sha256=0f5ada47b083f4bddb3457af7f9ccee627e498a510fd530c4be7993745fdc6bd`.
+- Original local-table execution: `artifacts:2026-10-29-secure-state-dependencies/execution.json sha256=7ba2b4450db01f31ba3f28fffde3389ac35442f5bd785a25816d2d6a2ad259bf`.
+- Derivation dispatch: `artifacts:2026-10-29-secure-state-dependencies/derivation-request.json sha256=dada58ecc9d2408ab2a787920869f55678fc3b8c6a2aad4d8647b5f6644a83fe`.
+- Dispatch instrument: `artifacts:2026-10-29-secure-state-dependencies/derivation-request.py sha256=7b364ed8db9344e78c5eabb544d7181518fb8c428ae1536e88a5fbe6ce91d590`.
+- Passive device check: `artifacts:2026-10-29-secure-state-device/findings.json sha256=fa479e2a79eb7f7d4fdca2b63365b284f87c760bee2cd994813fc6e71b190108`.
+
 ## Hidden dependencies and disposition
 
 | Dependency | Disposition |
@@ -185,6 +238,28 @@ Commands, input identities, and observed result lines belong with the affected e
 A host test result does not establish OEM execution.
 A subsystem guest result does not establish physical equivalence.
 A historical trace does not establish a new revision's result.
+
+### Stateful research qualification, 2026-10-29
+
+`make build JOBS=4` completed the patched QBox runtime and launcher.
+`cargo test --locked --bin qcom-vp` passed 123 host tests.
+Six targeted platform tests passed with `--include-ignored`.
+They cover explicit roots, the Lua profile, default crypto behavior, managed-key ownership, and existing UFS behavior.
+
+The RPMB procedure passed fresh, resume, and clone execution through the authored guest.
+All three runs reached `0x600d0000` after their assertions.
+The child returned two for that deliberate unmapped access, and the launcher correctly returned failure.
+The continued runs preserved the RPMB bytes while checking authenticated reads and rejected writes.
+
+Additional executions rejected empty, truncated, corrupt, and wrong-geometry backing files.
+They also checked writer exclusion, partial temporary-file recovery, and refusal of a temporary symlink.
+The launcher rejected changed source bytes and a different manifest before guest execution.
+The separate original-firmware procedure passed its five operations, including restart and tamper rejection.
+
+These results do not establish a new OEM boot milestone or physical equivalence.
+The retained record identifies inputs, commands, results, and limits:
+`artifacts:2026-10-29-stateful-environments/qualification.json sha256=e06bdb953bbb5af840054bbc67bfa5e034ffc264e28d7acd03daeb2d436f68e5`.
+
 
 
 ## Earlier requalification, 2026-10-28

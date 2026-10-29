@@ -17,5 +17,6 @@ return function(o)
     if o.tme_runtime_api_map then
         dofile(directory..'runtime.lua')(p,o)
     end
+    dofile(directory .. '../security-roots.lua')(p, o)
     return p
 end

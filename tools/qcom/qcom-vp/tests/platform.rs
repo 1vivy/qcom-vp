@@ -331,6 +331,10 @@ fn rpmh_completes_active_batches_and_isolates_requesters() {
 }
 
 fn run_native_consumer(fixture: &str, marker: &str) {
+    run_native_consumer_modes(fixture, &[(&[], marker)]);
+}
+
+fn run_native_consumer_modes(fixture: &str, modes: &[(&[&str], &str)]) {
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let install = install_prefix().canonicalize().unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -362,13 +366,16 @@ fn run_native_consumer(fixture: &str, marker: &str) {
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let output = Command::new("timeout")
-        .arg("10")
-        .arg(executable)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(String::from_utf8_lossy(&output.stdout).contains(marker));
+    for (args, marker) in modes {
+        let output = Command::new("timeout")
+            .arg("10")
+            .arg(&executable)
+            .args(*args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(marker));
+    }
 }
 
 #[test]
@@ -589,6 +596,19 @@ fn clic_delivers_id64_and_preserves_masks_priority_and_level_sources() {
 #[ignore = "Requires make build and a C++17 compiler"]
 fn qce_bam_hashes_real_buffers_and_preserves_context_and_dma_security() {
     run_native_consumer("qce-bam", "QCE_BAM_HASH_PASS");
+}
+
+#[test]
+#[ignore = "Requires make build and a C++17 compiler"]
+fn explicit_gpce_roots_change_and_reproduce_cmac_and_reject_invalid_values() {
+    run_native_consumer_modes(
+        "qce-bam",
+        &[
+            (&["--root-profile"], "QCE_ROOT_PROFILE_PASS"),
+            (&["--invalid-length"], "QCE_ROOT_INVALID_PASS"),
+            (&["--invalid-hex"], "QCE_ROOT_INVALID_PASS"),
+        ],
+    );
 }
 
 #[test]
@@ -2055,6 +2075,48 @@ fn managed_keys_bind_inputs_enforce_ownership_and_erase_on_clear() {
         ],
     );
     run_fixture(directory.path(), &fixture, 0x600d0000);
+}
+
+#[test]
+#[ignore = "Requires make build, Clang, LLD, and llvm-objcopy"]
+fn declared_root_profile_reaches_tme_managed_key_output() {
+    let guest_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tme-keys");
+    let platform_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/key-roots");
+    let directory = tempfile::tempdir().unwrap();
+    let mut input: Vec<u8> = (0..32).chain(0..32).collect();
+    input[37] ^= 1;
+    std::fs::write(directory.path().join("input.bin"), input).unwrap();
+    let driver = guest_fixture.join("driver.c");
+    compile_guest(
+        directory.path(),
+        &guest_fixture,
+        "producer",
+        "aarch64-none-elf",
+        "0x300000",
+        &[
+            "-ffreestanding",
+            "-fno-builtin",
+            "-mgeneral-regs-only",
+            "-O2",
+            "-DROOT_PROFILE",
+            driver.to_str().unwrap(),
+        ],
+    );
+    run_fixture(directory.path(), &platform_fixture, 0x600d0000);
+}
+
+#[test]
+#[ignore = "Requires make build, a C++17 compiler, and OpenSSL"]
+fn explicit_tme_roots_change_and_reproduce_managed_hash_and_reject_invalid_values() {
+    run_native_consumer_modes(
+        "key-roots",
+        &[
+            (&["--root-profile"], "TME_ROOT_PROFILE_PASS"),
+            (&["--invalid-length"], "TME_ROOT_INVALID_PASS"),
+            (&["--invalid-hex"], "TME_ROOT_INVALID_PASS"),
+            (&["--disabled"], "TME_ROOT_INVALID_PASS"),
+        ],
+    );
 }
 
 #[test]

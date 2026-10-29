@@ -1421,8 +1421,23 @@ The RPMB well-known LU belongs to the QEMU UFS device, so the frame protocol liv
 Patch `0026-implement-ufs-rpmb.patch` implements JESD220 key programming, counter reads, authenticated writes and reads, and result reads.
 It uses QEMU's HMAC-SHA256 and keeps the key, the counter, and the data in device state for one run.
 The SM8850 board declares a 4 MiB region. This value is a virtual profile, because no device capture names the size.
-Each run starts unprogrammed, as a factory-fresh device.
+Without a backing file, each process starts unprogrammed, as a factory-fresh device.
 Secure write protection requests remain unsupported and return CHECK CONDITION.
+
+## Persist RPMB mutations inside the native owner
+
+Patch `0030-persist-ufs-rpmb.patch` adds optional durable state to the existing UFS owner.
+The SystemC wrapper cannot observe accepted RPMB mutations or delay their responses until storage completes.
+The native owner must commit key, counter, and media changes before it reports success.
+This requirement places persistence inside libqemu rather than a separate storage proxy.
+
+The backing format is virtual. It is not a physical RPMB dump format.
+An atomic replacement keeps the committed counter and media together.
+A stable adjacent lock excludes another writer during replacement.
+Directory-flush failure remains a failed request with indeterminate crash durability.
+The environment launcher copies the complete declared collection instead of claiming a live-machine snapshot.
+The [RPMB procedure](../../../environments/qcom/rpmb/README.md) exercises that boundary through authored firmware.
+
 
 ## Add a bulk memory access path for device DMA
 

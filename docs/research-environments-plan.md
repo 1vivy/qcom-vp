@@ -279,6 +279,22 @@ Deliverable: a state inventory that maps each selected function to supported con
 An environment can qualify a bounded function without reproducing the whole device.
 An interface census or boot milestone alone cannot qualify that function.
 
+The stateful implementation now provides two bounded examples.
+The [RPMB example](../environments/qcom/rpmb/README.md) uses authored firmware through QBox and the UFS request path.
+The [local-authority example](../environments/qcom/secure-storage/README.md) executes original TZ instructions with explicit host services.
+These examples qualify different boundaries. Neither proves the phone's key source or active backend.
+
+The environment manifest separates immutable inputs from declared mutable state.
+Resume and clone preserve the complete state collection and its profile identity.
+A new identity requires fresh state instead of incompatible protected objects.
+QCE and TME accept explicit roots through existing Lua composition.
+Their existing public roots remain the defaults.
+
+The implementation retains the open provider question rather than inventing a hardware dependency.
+The trace establishes the client request, but its registered provider and root source remain unidentified.
+The [inventory](environment-inventory.md#stateful-local-authority-and-derivation-boundary) records the observations, side effects, and remaining qualification.
+
+
 ### B4. Qualify the reworked environments
 
 A result such as a later boot milestone is an observation, not proof of every preceding model.
@@ -323,7 +339,7 @@ The second part tests the first rather than merely reorganizing files to match i
 | Initial experiment | Reuse the IPCC native fixture with source-aware routing, queue operations, interrupts, and aliases. |
 | External composition | Launch declared QBox Lua directly. The environment manifest pins files and describes conditions, not MMIO geometry. |
 | Repeatability | Two independent preparations produced the same manifest hash and expected guest observation. This does not establish deterministic scheduling. |
-| Storage | The bounded example uses no storage. The launcher copies declared raw files independently, and a host test checks write isolation. |
+| Storage | IPCC needs no storage. The RPMB example qualifies declared persistent state, authenticated operations, restart, and independent clones. |
 | Qualification | Guest failure, hash rejection, and real-process timeout remain failures. No physical or retail-security equivalence claim follows. |
 
 The [IPCC procedure](../environments/qcom/ipcc/README.md) records the executable commands and results.

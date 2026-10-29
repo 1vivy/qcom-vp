@@ -1037,7 +1037,47 @@ The model implements these request types:
 A response without a programmed key carries a zero MAC.
 A write uses at most `bRPMB_ReadWriteSize` frames, 64 in the geometry descriptor.
 Malformed command fields, other request types, and IN lengths without a matching response return CHECK CONDITION.
-Device reset discards pending responses. The key, the counter, and the data persist for the run.
-Each run starts with an unprogrammed RPMB.
+Device reset discards pending responses only. The key, the counter, and the media remain.
 The guest fixture checks the descriptor, NO_KEY results, single key programming, counter reads,
 authenticated writes and reads, replay, MAC, and address failures, and length rejection.
+
+#### Durable RPMB state
+
+Patch `0030-persist-ufs-rpmb.patch` adds the `rpmb-state-file` controller property.
+An empty value keeps the in-process state of patch `0026`.
+A nonempty value names one local backing file.
+
+The file starts with a 96-byte header and continues with the media.
+The header holds the identity fields, the key, the write counter, and a SHA-256 digest.
+The identity fields are a magic value, a format version, the block size, the block count, and the key flag.
+The digest covers the header identity fields and the complete media.
+The digest detects file damage. It does not prevent a host from replacing state or restoring an older snapshot.
+A file with a wrong size, a wrong geometry, a wrong version, or a wrong digest fails realize.
+An existing zero-length file also fails realize.
+The model creates a new file only with an exclusive create.
+
+The model writes a complete snapshot to `<file>.tmp` and renames it over the state file.
+It creates the temporary file exclusively and never truncates an existing temporary file.
+It flushes the snapshot before the rename, and it flushes the directory after the rename.
+A failed snapshot or rename leaves the previous file in place, and the device restores its memory state.
+A failed directory flush after the rename keeps the new file.
+The device then reports failure and keeps the new memory state, so the durable result is indeterminate.
+A failed authenticated write returns WRITE_FAILURE. A failed key program returns GENERAL_FAILURE.
+An authenticated request that fails its checks does not change the file.
+
+The adjacent `<file>.lock` file holds one exclusive writer lock for the device lifetime.
+The lock file must remain empty and regular. The model never unlinks it.
+A second writer fails realize with an already-in-use error.
+
+The model treats `<file>.tmp` as a reserved synchronization path.
+It removes a leftover temporary file only after it checks for a regular, nonsymlink file under the lock.
+An interrupted write can leave a partial temporary file. The model removes that file on the next open.
+The model creates temporary files exclusively and does not overwrite an unexpected file.
+
+The second guest run performs rejected writes only. Its `rpmb.bin` stays byte-identical.
+
+#### RPMB experiment procedure
+
+The maintained experiment uses `environments/qcom/rpmb/prepare.py`.
+It declares six seeded LUN states, the RPMB backing file, and two synchronization paths.
+The [RPMB environment README](../../../environments/qcom/rpmb/README.md) gives the fresh, resume, clone, and invalid-input commands.

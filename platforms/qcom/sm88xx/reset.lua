@@ -893,11 +893,11 @@ return function(o)
         initiator_socket={bind='&tme_external_router.target_socket'}}
     protection_port('ufs_dma_protection','tme_protection1','apss',0,'ufs_ram_router',0x01f00000)
     -- QSEE 0x157485a4..0x157485d8 accepts 0x100..0x8000 RPMB sectors from UFSDxe.
-    -- The virtual profile declares a 4 MiB RPMB region. It is not a captured device size.
+    -- The default profile declares 4 MiB. An explicit profile can select another geometry.
     dofile(directory..'ufs.lua')(p,{router=a,ram_router='ufs_dma_protection',
         manager='qemu_inst_mgr',irq=irq,virtual_phy=true,luns=o.luns,
         boot_enable=o.boot_enable,boot_lun_en=o.boot_lun_en,boot_lun_ids=o.boot_lun_ids,
-        rpmb_size_kib=4096})
+        rpmb_size_kib=o.rpmb_size_kib or 4096,rpmb_state_file=o.rpmb_state_file})
     -- QSEE 0x1577b1d8 uses the UFS ICE error branch.
     -- 0x1577b238 writes zero to 0x01d8e204.
     -- 0x1577b240 reads 0x01d8e200 and writes its top two bits to 0x01d8e208.

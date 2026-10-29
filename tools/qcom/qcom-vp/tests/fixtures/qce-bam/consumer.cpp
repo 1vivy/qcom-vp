@@ -6,12 +6,14 @@
 #include <tlm_utils/simple_initiator_socket.h>
 #include <tlm_utils/multi_passthrough_target_socket.h>
 #include <tlm-extensions/mem-tx-attrs.h>
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
-
+#include <stdexcept>
+#include <string>
 namespace {
 
 // Physical RAM is a separate array. No descriptor, ring or digest address below
@@ -201,7 +203,9 @@ struct Consumer : sc_core::sc_module {
 
     using Bus = tlm_utils::simple_initiator_socket<Consumer>;
 
-    explicit Consumer(sc_core::sc_module_name name) : sc_module(name) {
+    explicit Consumer(sc_core::sc_module_name name, const std::string& key = {})
+        : sc_module(name) {
+        if (!key.empty()) qce.oem_hw_key_hex.set_value(key);
         bam.num_pipes = 2;
         bam.num_ees = 1;
         bam.revision = 0x20;
@@ -227,6 +231,26 @@ struct Consumer : sc_core::sc_module {
         bam.stream_socket.bind(qce.stream_socket);
         qce.stream_ready.bind(bam.stream_ready);
         bam.irq[0].bind(irq);
+    }
+
+    std::array<unsigned char, 16> oem_root_probe() {
+        configure();
+        write_bam(0, 2);
+        write_bam(0x3004, 3);
+        pipe(0, 0, 24, false);
+        pipe(1, 0x100, 16, true);
+        for (unsigned i = 0; i < 16; ++i)
+            ram.bytes[input_e + i] = static_cast<unsigned char>(0x10 + i);
+        cmac(16, true);
+        write_qce(0xc000, 7);
+        ram.descriptor(ring1, 0, va_base + 0x5300, 128, 0xc0);
+        write_bam(0xd818, 8);
+        ram.descriptor(ring0, 0, va_base + 0x4400, 16, 0xc0);
+        write_bam(0xc818, 8);
+        sc_core::sc_start(1, sc_core::SC_NS);
+        std::array<unsigned char, 16> result{};
+        std::copy_n(ram.bytes.data() + digest_d, result.size(), result.data());
+        return result;
     }
 
     std::uint32_t access(Bus& bus, unsigned address, bool writing,
@@ -362,9 +386,38 @@ struct Consumer : sc_core::sc_module {
     }
 };
 
-int sc_main(int, char**) {
+int sc_main(int argc, char** argv) {
     cci_utils::broker broker{"broker"};
     cci::cci_register_broker(broker);
+    if (argc > 1 && std::string(argv[1]) == "--root-profile") {
+        const std::string root_a(64, '1');
+        const std::string root_b(64, '2');
+        Consumer first{"first", root_a};
+        Consumer repeat{"repeat", root_a};
+        Consumer different{"different", root_b};
+        sc_core::sc_start(sc_core::SC_ZERO_TIME);
+        const auto a = first.oem_root_probe();
+        const auto same = repeat.oem_root_probe();
+        const auto b = different.oem_root_probe();
+        assert(a == same && a != b);
+        std::cout << "QCE_ROOT_PROFILE_PASS\n";
+        return 0;
+    }
+    if (argc > 1 && (std::string(argv[1]) == "--invalid-length" ||
+                     std::string(argv[1]) == "--invalid-hex")) {
+        const auto bad = std::string(argv[1]) == "--invalid-length" ?
+            std::string(63, '1') : std::string(63, '1') + 'g';
+        Consumer invalid{"invalid", bad};
+        try {
+            sc_core::sc_start(sc_core::SC_ZERO_TIME);
+        } catch (const std::invalid_argument& error) {
+            assert(std::string(error.what()).find("oem_hw_key_hex") != std::string::npos);
+            std::cout << "QCE_ROOT_INVALID_PASS\n";
+            return 0;
+        }
+        return 1;
+    }
+
     Consumer c{"consumer"};
     sc_core::sc_start(sc_core::SC_ZERO_TIME);
     c.configure();
@@ -412,8 +465,8 @@ int sc_main(int, char**) {
     sc_core::sc_start(1, sc_core::SC_NS);
     c.ram.digest(digest_d, "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
                            "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f", 64);
-    // The OEM key GO alias runs AES-256 CMAC with the virtual OEM key, which is
-    // SHA-256 of its public label. Python cryptography computes the expected values.
+    // This default-profile path derives the virtual OEM key from its public label.
+    // The separate root-profile mode checks explicit roots through the same CMAC path.
     assert(c.read_qce(0xa108) & 1);
     for (unsigned i = 0; i < 16; ++i) c.ram.bytes[input_e + i] = static_cast<unsigned char>(0x10 + i);
     // A nonfinal block publishes the chaining value AES-256(K, M).

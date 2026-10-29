@@ -54,6 +54,8 @@ Its default is `~/.cache/qcom-vp`, not a firmware or evidence store.
 
 The [environment runbook](docs/environments.md) describes external Lua composition, input identities, and experiment outcomes.
 Start with the [IPCC procedure](environments/qcom/ipcc/README.md) for a complete experiment with repeat and failure checks.
+The [RPMB procedure](environments/qcom/rpmb/README.md) adds durable state, authenticated requests, resume, and clone checks without vendor firmware.
+The [local-authority procedure](environments/qcom/secure-storage/README.md) exercises original TZ routines with an external image and explicit test inputs.
 
 For another experiment, set `ENVIRONMENT_MANIFEST` to the path of its manifest.
 Use a new output directory:

@@ -1,0 +1,595 @@
+--- a/hw/ufs/ufs.h
++++ b/hw/ufs/ufs.h
+@@ -103,6 +103,7 @@
+     uint32_t wb_max_size; /* WB Maximum allocation units */
+     uint32_t wb_min_size; /* WB Minimum allocation units */
+     uint32_t rpmb_size_kib; /* RPMB region 0 size, zero disables RPMB */
++    char *rpmb_state_file; /* Local backing file, empty keeps volatile state */
+ } UfsParams;
+ 
+ /*
+@@ -167,6 +168,7 @@
+     bool result_valid;
+     uint8_t *pending;
+     uint32_t pending_frames;
++    int lock_fd; /* Exclusive writer lock descriptor, -1 when volatile */
+ } UfsRpmb;
+ 
+ typedef struct UfsHc {
+@@ -244,6 +246,10 @@
+     u->rpmb.result_valid = false;
+ }
+ 
++bool ufs_rpmb_state_open(UfsHc *u, Error **errp);
++void ufs_rpmb_state_close(UfsHc *u);
++bool ufs_rpmb_state_commit(UfsHc *u, bool *applied);
++
+ static inline uint32_t ufs_mcq_sq_tail(UfsHc *u, uint32_t qid)
+ {
+     return u->mcq_op_reg[qid].sq.tp;
+--- a/hw/ufs/ufs.c
++++ b/hw/ufs/ufs.c
+@@ -2838,6 +2838,12 @@
+         return false;
+     }
+ 
++    if (u->params.rpmb_state_file && *u->params.rpmb_state_file &&
++        !u->params.rpmb_size_kib) {
++        error_setg(errp, "rpmb-state-file requires a nonzero rpmb-size-kib");
++        return false;
++    }
++
+     return true;
+ }
+ 
+@@ -2922,6 +2928,7 @@
+     }
+ 
+     u->rpmb.blocks = u->params.rpmb_size_kib * 1024 / UFS_RPMB_BLOCK_SIZE;
++    u->rpmb.lock_fd = -1;
+     if (u->rpmb.blocks) {
+         u->rpmb.data = g_malloc0((size_t)u->rpmb.blocks * UFS_RPMB_BLOCK_SIZE);
+     }
+@@ -3124,6 +3131,9 @@
+     qbus_init(&u->bus, sizeof(UfsBus), TYPE_UFS_SYSBUS_BUS, dev, NULL);
+ 
+     ufs_init_state(u);
++    if (!ufs_rpmb_state_open(u, errp)) {
++        return;
++    }
+     ufs_init_hc(u);
+     ufs_init_sysbus(dev);
+ 
+@@ -3145,6 +3155,7 @@
+     }
+     g_free(u->req_list);
+     ufs_rpmb_clear_responses(u);
++    ufs_rpmb_state_close(u);
+     g_free(u->rpmb.data);
+     u->rpmb.data = NULL;
+ 
+@@ -3180,6 +3191,7 @@
+     DEFINE_PROP_UINT32("wb-max-size", UfsHc, params.wb_max_size, 0x400),
+     DEFINE_PROP_UINT32("wb-min-size", UfsHc, params.wb_min_size, 0x100),
+     DEFINE_PROP_UINT32("rpmb-size-kib", UfsHc, params.rpmb_size_kib, 0),
++    DEFINE_PROP_STRING("rpmb-state-file", UfsHc, params.rpmb_state_file),
+ };
+ 
+ static const VMStateDescription ufs_vmstate = {
+--- a/hw/ufs/lu.c
++++ b/hw/ufs/lu.c
+@@ -16,6 +16,8 @@
+ #include "scsi/constants.h"
+ #include "system/block-backend.h"
+ #include "qemu/cutils.h"
++#include "qemu/error-report.h"
++#include "crypto/hash.h"
+ #include "crypto/hmac.h"
+ #include "trace.h"
+ #include "ufs.h"
+@@ -345,6 +347,416 @@
+     UFS_RPMB_COUNTER_EXPIRED = 0x80,
+ };
+ 
++/*
++ * Local RPMB backing file. The header holds the nonvolatile identity and a
++ * SHA-256 digest over the header and the media data. Each mutation writes a
++ * complete snapshot to a temporary file and renames it over the state file.
++ * An adjacent lock file keeps one writer across that replacement.
++ */
++#define UFS_RPMB_STATE_MAGIC "QCOMVPRB"
++#define UFS_RPMB_STATE_VERSION 1
++#define UFS_RPMB_STATE_HEADER_SIZE 96
++#define UFS_RPMB_STATE_DIGEST_OFFSET 64
++#define UFS_RPMB_STATE_KEY_OFFSET 32
++#define UFS_RPMB_STATE_FLAG_KEY 1
++
++static size_t ufs_rpmb_state_data_size(const UfsRpmb *rpmb)
++{
++    return (size_t)rpmb->blocks * UFS_RPMB_BLOCK_SIZE;
++}
++
++static size_t ufs_rpmb_state_file_size(const UfsRpmb *rpmb)
++{
++    return UFS_RPMB_STATE_HEADER_SIZE + ufs_rpmb_state_data_size(rpmb);
++}
++
++static void ufs_rpmb_state_build_header(const UfsRpmb *rpmb, uint8_t *header)
++{
++    memset(header, 0, UFS_RPMB_STATE_HEADER_SIZE);
++    memcpy(header, UFS_RPMB_STATE_MAGIC, sizeof(UFS_RPMB_STATE_MAGIC) - 1);
++    stl_be_p(header + 8, UFS_RPMB_STATE_VERSION);
++    stl_be_p(header + 12, UFS_RPMB_BLOCK_SIZE);
++    stl_be_p(header + 16, rpmb->blocks);
++    stl_be_p(header + 20, rpmb->key_programmed ? UFS_RPMB_STATE_FLAG_KEY : 0);
++    stl_be_p(header + 24, rpmb->write_counter);
++    memcpy(header + UFS_RPMB_STATE_KEY_OFFSET, rpmb->key, sizeof(rpmb->key));
++}
++
++/* The digest covers the identity fields and the media, without a copy. */
++static bool ufs_rpmb_state_digest(const uint8_t *header, const uint8_t *data,
++                                  size_t data_len, uint8_t *digest)
++{
++    struct iovec iov[] = {
++        { .iov_base = (void *)header, .iov_len = UFS_RPMB_STATE_DIGEST_OFFSET },
++        { .iov_base = (void *)data, .iov_len = data_len },
++    };
++    uint8_t *result = digest;
++    size_t result_len = QCRYPTO_HASH_DIGEST_LEN_SHA256;
++
++    return qcrypto_hash_bytesv(QCRYPTO_HASH_ALGO_SHA256, iov, ARRAY_SIZE(iov),
++                               &result, &result_len, NULL) == 0 &&
++           result_len == QCRYPTO_HASH_DIGEST_LEN_SHA256;
++}
++
++static int ufs_rpmb_state_read_at(int fd, void *buf, size_t len, off_t offset)
++{
++    size_t done = 0;
++
++    while (done < len) {
++        ssize_t ret = RETRY_ON_EINTR(pread(fd, (uint8_t *)buf + done,
++                                           len - done, offset + done));
++        if (ret <= 0) {
++            return -1;
++        }
++        done += ret;
++    }
++    return 0;
++}
++
++static int ufs_rpmb_state_write_at(int fd, const void *buf, size_t len,
++                                   off_t offset)
++{
++    size_t done = 0;
++
++    while (done < len) {
++        ssize_t ret = RETRY_ON_EINTR(pwrite(fd, (const uint8_t *)buf + done,
++                                            len - done, offset + done));
++        if (ret <= 0) {
++            return -1;
++        }
++        done += ret;
++    }
++    return 0;
++}
++
++static bool ufs_rpmb_state_header_valid(const UfsRpmb *rpmb,
++                                        const uint8_t *header)
++{
++    uint32_t flags = ldl_be_p(header + 20);
++
++    return memcmp(header, UFS_RPMB_STATE_MAGIC,
++                  sizeof(UFS_RPMB_STATE_MAGIC) - 1) == 0 &&
++           ldl_be_p(header + 8) == UFS_RPMB_STATE_VERSION &&
++           ldl_be_p(header + 12) == UFS_RPMB_BLOCK_SIZE &&
++           ldl_be_p(header + 16) == rpmb->blocks &&
++           !(flags & ~UFS_RPMB_STATE_FLAG_KEY) &&
++           ((flags & UFS_RPMB_STATE_FLAG_KEY) ||
++            ldl_be_p(header + 24) == 0) &&
++           ldl_be_p(header + 28) == 0;
++}
++
++/*
++ * A reserved temporary path can contain an interrupted snapshot. Under the
++ * stable lock, remove it only after lstat and fstat confirm a regular file.
++ * Returns 1 when the path exists, 0 when it is absent, and -1 on rejection.
++ */
++static int ufs_rpmb_state_temp_check(const char *tmp_path, Error **errp)
++{
++    struct stat path_stat, file_stat;
++    int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
++    int fd;
++
++#ifdef O_NOFOLLOW
++    flags |= O_NOFOLLOW;
++#endif
++    if (lstat(tmp_path, &path_stat) < 0) {
++        if (errno == ENOENT) {
++            return 0;
++        }
++        error_setg_errno(errp, errno, "Cannot stat RPMB temporary path '%s'",
++                         tmp_path);
++        return -1;
++    }
++    if (!S_ISREG(path_stat.st_mode)) {
++        error_setg(errp, "RPMB temporary path '%s' is not a regular file",
++                   tmp_path);
++        return -1;
++    }
++    fd = qemu_open(tmp_path, flags, errp);
++    if (fd < 0) {
++        return -1;
++    }
++    if (fstat(fd, &file_stat) < 0) {
++        error_setg_errno(errp, errno, "Cannot stat RPMB temporary path '%s'",
++                         tmp_path);
++        close(fd);
++        return -1;
++    }
++    close(fd);
++    if (!S_ISREG(file_stat.st_mode) ||
++        path_stat.st_dev != file_stat.st_dev ||
++        path_stat.st_ino != file_stat.st_ino) {
++        error_setg(errp, "RPMB temporary path '%s' changed during inspection",
++                   tmp_path);
++        return -1;
++    }
++    return 1;
++}
++
++static bool ufs_rpmb_state_sync_dir(const char *path)
++{
++    g_autofree char *dir = g_path_get_dirname(path);
++    int flags = O_RDONLY | O_CLOEXEC;
++    bool ok;
++    int fd;
++
++#ifdef O_DIRECTORY
++    flags |= O_DIRECTORY;
++#endif
++    fd = qemu_open(dir, flags, NULL);
++    if (fd < 0) {
++        return false;
++    }
++    ok = fsync(fd) == 0;
++    close(fd);
++    return ok;
++}
++
++/*
++ * Writes the header and the complete media to one path and flushes them.
++ * A new file starts unprogrammed with zero media, as a factory device.
++ */
++static bool ufs_rpmb_state_write_snapshot(const char *tmp_path,
++                                          const UfsRpmb *rpmb)
++{
++    uint8_t header[UFS_RPMB_STATE_HEADER_SIZE];
++    size_t data_len = ufs_rpmb_state_data_size(rpmb);
++    int flags = O_RDWR | O_EXCL | O_CLOEXEC;
++    int fd;
++
++#ifdef O_NOFOLLOW
++    flags |= O_NOFOLLOW;
++#endif
++    ufs_rpmb_state_build_header(rpmb, header);
++    if (!ufs_rpmb_state_digest(header, rpmb->data, data_len,
++                               header + UFS_RPMB_STATE_DIGEST_OFFSET)) {
++        error_report("Cannot compute the RPMB state digest");
++        return false;
++    }
++    fd = qemu_create(tmp_path, flags, S_IRUSR | S_IWUSR, NULL);
++    if (fd < 0) {
++        error_report("Cannot create RPMB state file '%s': %s", tmp_path,
++                     strerror(errno));
++        return false;
++    }
++    if (ufs_rpmb_state_write_at(fd, header, sizeof(header), 0) < 0 ||
++        ufs_rpmb_state_write_at(fd, rpmb->data, data_len,
++                                UFS_RPMB_STATE_HEADER_SIZE) < 0 ||
++        fsync(fd) < 0) {
++        error_report("Cannot write RPMB state file '%s': %s", tmp_path,
++                     strerror(errno));
++        close(fd);
++        qemu_unlink(tmp_path);
++        return false;
++    }
++    close(fd);
++    return true;
++}
++
++bool ufs_rpmb_state_open(UfsHc *u, Error **errp)
++{
++    UfsRpmb *rpmb = &u->rpmb;
++    const char *path = u->params.rpmb_state_file;
++    g_autofree char *lock_path = NULL;
++    g_autofree char *tmp_path = NULL;
++    uint8_t header[UFS_RPMB_STATE_HEADER_SIZE];
++    uint8_t digest[QCRYPTO_HASH_DIGEST_LEN_SHA256];
++    struct stat st;
++    bool created = false;
++    int lock_fd;
++    int fd;
++    int open_flags = O_RDWR | O_CLOEXEC | O_NONBLOCK;
++    int lock_flags = O_RDWR | O_CLOEXEC | O_NONBLOCK;
++    int temp;
++
++#ifdef O_NOFOLLOW
++    open_flags |= O_NOFOLLOW;
++    lock_flags |= O_NOFOLLOW;
++#endif
++
++    if (!path || !*path) {
++        return true;
++    }
++
++    lock_path = g_strdup_printf("%s.lock", path);
++    tmp_path = g_strdup_printf("%s.tmp", path);
++    lock_fd = qemu_create(lock_path, lock_flags, S_IRUSR | S_IWUSR, errp);
++    if (lock_fd < 0) {
++        return false;
++    }
++    if (fstat(lock_fd, &st) < 0) {
++        error_setg_errno(errp, errno, "Cannot stat RPMB lock path '%s'",
++                         lock_path);
++        close(lock_fd);
++        return false;
++    }
++    if (!S_ISREG(st.st_mode)) {
++        error_setg(errp, "RPMB lock path '%s' is not a regular file",
++                   lock_path);
++        close(lock_fd);
++        return false;
++    }
++    if (st.st_size != 0) {
++        error_setg(errp, "RPMB lock path '%s' is not empty", lock_path);
++        close(lock_fd);
++        return false;
++    }
++    if (qemu_lock_fd(lock_fd, 0, 0, true) < 0) {
++        error_setg(errp, "RPMB state file '%s' is already in use", path);
++        close(lock_fd);
++        return false;
++    }
++    /*
++     * The lock protects this reserved temporary path. Remove only a regular
++     * file after checking its type and inode. Interrupted snapshots can be
++     * partial because the committed state file remains authoritative.
++     */
++    temp = ufs_rpmb_state_temp_check(tmp_path, errp);
++    if (temp < 0) {
++        close(lock_fd);
++        return false;
++    }
++    if (temp > 0) {
++        qemu_unlink(tmp_path);
++    }
++
++    fd = qemu_open(path, open_flags, NULL);
++    if (fd < 0 && errno == ENOENT) {
++        fd = qemu_create(path, open_flags | O_EXCL,
++                         S_IRUSR | S_IWUSR, NULL);
++        if (fd < 0 && errno == EEXIST) {
++            fd = qemu_open(path, open_flags, errp);
++        } else if (fd >= 0) {
++            created = true;
++        } else {
++            error_setg_errno(errp, errno, "Cannot create RPMB state file '%s'",
++                             path);
++        }
++    } else if (fd < 0) {
++        error_setg_errno(errp, errno, "Cannot open RPMB state file '%s'", path);
++    }
++    if (fd < 0) {
++        close(lock_fd);
++        return false;
++    }
++
++    if (created) {
++        close(fd);
++        if (!ufs_rpmb_state_write_snapshot(tmp_path, rpmb)) {
++            /* Remove only the empty file that this call created. */
++            qemu_unlink(path);
++            error_setg(errp, "Cannot initialize RPMB state file '%s'", path);
++            close(lock_fd);
++            return false;
++        }
++        if (rename(tmp_path, path) < 0) {
++            int saved_errno = errno;
++
++            error_setg_errno(errp, saved_errno,
++                             "Cannot initialize RPMB state file '%s'", path);
++            close(lock_fd);
++            return false;
++        }
++        if (!ufs_rpmb_state_sync_dir(path)) {
++            error_setg_errno(errp, errno,
++                             "Cannot sync the directory of RPMB state file '%s'",
++                             path);
++            close(lock_fd);
++            return false;
++        }
++        rpmb->lock_fd = lock_fd;
++        return true;
++    }
++
++    if (fstat(fd, &st) < 0) {
++        error_setg_errno(errp, errno, "Cannot stat RPMB state file '%s'", path);
++        goto fail;
++    }
++    if (!S_ISREG(st.st_mode)) {
++        error_setg(errp, "RPMB state file '%s' is not a regular file", path);
++        goto fail;
++    }
++    if ((uint64_t)st.st_size != ufs_rpmb_state_file_size(rpmb)) {
++        error_setg(errp, "RPMB state file '%s' holds %" PRIu64
++                   " bytes, the geometry requires %zu", path,
++                   (uint64_t)st.st_size, ufs_rpmb_state_file_size(rpmb));
++        goto fail;
++    }
++    if (ufs_rpmb_state_read_at(fd, header, sizeof(header), 0) < 0) {
++        error_setg_errno(errp, errno, "Cannot read RPMB state file '%s'", path);
++        goto fail;
++    }
++    if (!ufs_rpmb_state_header_valid(rpmb, header)) {
++        error_setg(errp, "RPMB state file '%s' has an invalid header", path);
++        goto fail;
++    }
++    if (ufs_rpmb_state_read_at(fd, rpmb->data,
++                               ufs_rpmb_state_data_size(rpmb),
++                               UFS_RPMB_STATE_HEADER_SIZE) < 0) {
++        error_setg_errno(errp, errno, "Cannot read RPMB state file '%s'", path);
++        goto fail;
++    }
++    if (!ufs_rpmb_state_digest(header, rpmb->data,
++                               ufs_rpmb_state_data_size(rpmb), digest) ||
++        memcmp(digest, header + UFS_RPMB_STATE_DIGEST_OFFSET,
++               sizeof(digest))) {
++        error_setg(errp, "RPMB state file '%s' failed its integrity check",
++                   path);
++        goto fail;
++    }
++    memcpy(rpmb->key, header + UFS_RPMB_STATE_KEY_OFFSET, sizeof(rpmb->key));
++    rpmb->key_programmed = ldl_be_p(header + 20) & UFS_RPMB_STATE_FLAG_KEY;
++    rpmb->write_counter = ldl_be_p(header + 24);
++    rpmb->lock_fd = lock_fd;
++    close(fd);
++    return true;
++
++fail:
++    close(fd);
++    close(lock_fd);
++    return false;
++}
++
++void ufs_rpmb_state_close(UfsHc *u)
++{
++    if (u->rpmb.lock_fd < 0) {
++        return;
++    }
++    close(u->rpmb.lock_fd);
++    u->rpmb.lock_fd = -1;
++}
++
++/*
++ * A complete snapshot reaches the file before the device reports success.
++ * A failed rename leaves the previous snapshot in place.
++ */
++bool ufs_rpmb_state_commit(UfsHc *u, bool *applied)
++{
++    g_autofree char *tmp_path = NULL;
++    const char *path = u->params.rpmb_state_file;
++
++    *applied = false;
++    if (u->rpmb.lock_fd < 0) {
++        return true;
++    }
++    tmp_path = g_strdup_printf("%s.tmp", path);
++    if (!ufs_rpmb_state_write_snapshot(tmp_path, &u->rpmb)) {
++        return false;
++    }
++    if (rename(tmp_path, path) < 0) {
++        error_report("Cannot replace RPMB state file '%s': %s", path,
++                     strerror(errno));
++        return false;
++    }
++    *applied = true;
++    if (!ufs_rpmb_state_sync_dir(path)) {
++        error_report("The RPMB state file '%s' replacement is not durable: %s",
++                     path, strerror(errno));
++        return false;
++    }
++    return true;
++}
++
+ static bool ufs_rpmb_mac(const UfsRpmb *rpmb, const uint8_t *frames,
+                          uint32_t count, uint8_t *mac)
+ {
+@@ -404,13 +816,16 @@
+ }
+ 
+ /* Returns the result code of an authenticated write. */
+-static uint16_t ufs_rpmb_write(UfsRpmb *rpmb, const uint8_t *frames,
+-                               uint32_t count)
++static uint16_t ufs_rpmb_write(UfsHc *u, const uint8_t *frames, uint32_t count)
+ {
++    UfsRpmb *rpmb = &u->rpmb;
+     const uint8_t *last = frames + (count - 1) * UFS_RPMB_FRAME_SIZE;
+     uint16_t address = lduw_be_p(frames + UFS_RPMB_ADDRESS);
+     uint16_t blocks = lduw_be_p(frames + UFS_RPMB_BLOCKS);
+     uint8_t mac[32];
++    g_autofree uint8_t *saved = NULL;
++    uint32_t saved_counter;
++    bool applied;
+ 
+     if (!rpmb->key_programmed) {
+         return UFS_RPMB_NO_KEY;
+@@ -428,12 +843,30 @@
+     if (blocks != count || (uint32_t)address + blocks > rpmb->blocks) {
+         return UFS_RPMB_ADDRESS_FAILURE;
+     }
++
++    /*
++     * The new media and counter reach the file before the device reports
++     * success. A failed snapshot leaves the previous file in place, so the
++     * saved memory state restores agreement.
++     */
++    saved = rpmb->lock_fd >= 0 ?
++        g_memdup2(rpmb->data + (size_t)address * UFS_RPMB_BLOCK_SIZE,
++                  (size_t)count * UFS_RPMB_BLOCK_SIZE) : NULL;
++    saved_counter = rpmb->write_counter;
+     for (uint32_t i = 0; i < count; i++) {
+         memcpy(rpmb->data + ((size_t)address + i) * UFS_RPMB_BLOCK_SIZE,
+                frames + i * UFS_RPMB_FRAME_SIZE + UFS_RPMB_DATA,
+                UFS_RPMB_BLOCK_SIZE);
+     }
+     rpmb->write_counter++;
++    if (!ufs_rpmb_state_commit(u, &applied)) {
++        if (!applied && saved) {
++            memcpy(rpmb->data + (size_t)address * UFS_RPMB_BLOCK_SIZE, saved,
++                   (size_t)count * UFS_RPMB_BLOCK_SIZE);
++            rpmb->write_counter = saved_counter;
++        }
++        return UFS_RPMB_WRITE_FAILURE;
++    }
+     return UFS_RPMB_OK;
+ }
+ 
+@@ -463,8 +896,17 @@
+         if (rpmb->key_programmed) {
+             result = UFS_RPMB_GENERAL_FAILURE;
+         } else {
++            bool applied;
++
+             memcpy(rpmb->key, frames + UFS_RPMB_MAC, sizeof(rpmb->key));
+             rpmb->key_programmed = true;
++            if (!ufs_rpmb_state_commit(u, &applied)) {
++                if (!applied) {
++                    memset(rpmb->key, 0, sizeof(rpmb->key));
++                    rpmb->key_programmed = false;
++                }
++                result = UFS_RPMB_GENERAL_FAILURE;
++            }
+         }
+         memset(rpmb->result, 0, sizeof(rpmb->result));
+         stw_be_p(rpmb->result + UFS_RPMB_RESULT, result);
+@@ -484,7 +926,7 @@
+         return ufs_rpmb_sign(rpmb, rsp, 1);
+     case UFS_RPMB_WRITE:
+         ufs_rpmb_drop_response(rpmb);
+-        result = ufs_rpmb_write(rpmb, frames, count);
++        result = ufs_rpmb_write(u, frames, count);
+         memset(rpmb->result, 0, sizeof(rpmb->result));
+         if (rpmb->key_programmed) {
+             stl_be_p(rpmb->result + UFS_RPMB_COUNTER, rpmb->write_counter);
+--- a/hw/ufs/ufs_pci.c
++++ b/hw/ufs/ufs_pci.c
+@@ -86,6 +86,9 @@
+               u->parent_obj.qdev.id);
+ 
+     ufs_init_state(u);
++    if (!ufs_rpmb_state_open(u, errp)) {
++        return;
++    }
+     ufs_init_hc(u);
+     ufs_init_pci(u, pci_dev);
+ 

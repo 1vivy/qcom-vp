@@ -2016,7 +2016,7 @@ The compatible completion selects 48 output bytes and publishes the actual copie
 
 ### Explicit virtual policy
 
-The model derives its 48-byte root from the public string `qcom-vp virtual TME managed-key profile v1` with SHA-384.
+With an empty `virtual_root_hex`, the model derives its 48-byte default root from the public string `qcom-vp virtual TME managed-key profile v1` with SHA-384.
 This deterministic identity is not a device secret and provides no production key protection.
 It permits reproducible virtual state without copying physical secrets.
 Only requester two with normalized credential two can derive.
@@ -2036,6 +2036,26 @@ The counter is big-endian one. The final big-endian length is 384 bits.
 This binding layout is an explicit substitute, not a recovered silicon serialization.
 The opaque policy words affect the derived bytes.
 They do not establish an implementation of the vendor's usage permissions or binding-state interpretation.
+
+### Configured virtual root input
+
+The model accepts the optional CCI parameter `virtual_root_hex`.
+The SoC platform wrappers apply it through `platforms/qcom/sm88xx/security-roots.lua`.
+Omit the field or set it to an empty string to keep the SHA-384 digest of the public identity above.
+A nonempty value must contain exactly 96 hexadecimal characters.
+Do not add a `0x` prefix or whitespace. The model accepts uppercase and lowercase letters.
+The model decodes the characters to the 48-byte root before simulation starts.
+The parameter requires `virtual_key_substitute=true`.
+The default model keeps that opt-in disabled.
+
+This root keys only the virtual command-two managed-key derivation.
+It does not change generated ECDH keys, transport-key derivation, image verification, or authorization.
+The root remains in the sequencer across command release, key cleanup, and guest reset.
+A new simulator process initializes it again from its profile.
+
+The public-label value is public test material.
+An explicit value needs its own provenance. The virtual derivation does not establish the physical TME algorithm.
+The profile does not export phone identity by default or provide production key protection.
 The virtual profile permits only internal HMAC use of its child keys.
 Authentication qualification therefore remains separate from functional boot progress.
 

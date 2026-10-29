@@ -7,6 +7,8 @@
 #include <async_event.h>
 #include <tlm_utils/simple_target_socket.h>
 #include <tlm_utils/simple_initiator_socket.h>
+#include <cci_configuration>
+#include <string>
 #include <stdexcept>
 #include <cstdint>
 #include <deque>
@@ -32,6 +34,8 @@ public:
     cci::cci_param<uint32_t> boot_lun_en{"boot_lun_en", 255, "Initial OEM boot LU ID"};
     cci::cci_param<uint32_t> rpmb_size_kib{
         "rpmb_size_kib", 0, "Declared RPMB region 0 size in KiB, zero disables RPMB"};
+    cci::cci_param<std::string> rpmb_state_file{
+        "rpmb_state_file", "", "Persistent RPMB state path, empty selects volatile host storage"};
     cci::cci_param<uint32_t> virtual_hw_revision{
         "virtual_hw_revision", 0x30010000, "Explicit virtual host revision, not a silicon measurement"};
     cci::cci_param<std::string> phy_clock_paths[6]{
@@ -84,6 +88,8 @@ public:
         m_dev.set_prop_bool("boot-enable", boot_enable.get_value());
         m_dev.set_prop_uint("boot-lun-en", boot_lun_en.get_value());
         m_dev.set_prop_uint("rpmb-size-kib", rpmb_size_kib.get_value());
+        if (!rpmb_state_file.get_value().empty())
+            m_dev.set_prop_str("rpmb-state-file", rpmb_state_file.get_value().c_str());
         qemu_dma.init_global(m_dev);
     }
     void end_of_elaboration() override {

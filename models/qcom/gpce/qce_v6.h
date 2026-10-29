@@ -11,6 +11,8 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -47,6 +49,8 @@ public:
     cci::cci_param<unsigned> selector_base0{"selector_base0", 0, "Virtual selector base from CRYPTO +0xb00"};
     cci::cci_param<unsigned> selector_base1{"selector_base1", 2, "Virtual selector base from CRYPTO +0xb08"};
     cci::cci_param<unsigned> selector_base2{"selector_base2", 4, "Virtual selector base from CRYPTO +0xb10"};
+    cci::cci_param<std::string> oem_hw_key_hex{
+        "oem_hw_key_hex", "", "Optional exact 32-byte virtual OEM hardware key in hexadecimal"};
 
     // The TME key master calls this sideband after a successful command 1c.
     // The transport key stays in this object and has no MMIO or host read path.
@@ -128,8 +132,14 @@ protected:
         }
         if (!aes_ctx_)
             SC_REPORT_FATAL("QCE_V6", "Cannot allocate the AES context");
-        (void)SHA256(reinterpret_cast<const unsigned char*>(oem_hw_key_label),
-            sizeof(oem_hw_key_label) - 1, oem_hw_key_.data());
+        const auto& configured_key = oem_hw_key_hex.get_value();
+        if (configured_key.empty()) {
+            (void)SHA256(reinterpret_cast<const unsigned char*>(oem_hw_key_label),
+                sizeof(oem_hw_key_label) - 1, oem_hw_key_.data());
+        } else if (!decode_hex_key(configured_key, oem_hw_key_.data(), oem_hw_key_.size())) {
+            throw std::invalid_argument(
+                "QCE oem_hw_key_hex must contain exactly 64 hexadecimal characters");
+        }
         std::cerr << "QCE_V6_POLICY model=" << name()
                   << " version=0x" << std::hex << version.get_value() << std::dec
                   << " bist=completed-cold first_slots=" << first_slot_count.get_value()
@@ -289,9 +299,27 @@ private:
     static constexpr std::uint32_t auth_first_bit = 1u << 17;
     static constexpr std::uint32_t auth_size_aes_mac = 15;
     static constexpr std::uint32_t aes_block_size = 16;
-    // The OEM hardware key comes from secure fuses on silicon. This virtual
-    // profile derives it from a public label. It is not a captured device secret.
+    // Silicon reads its OEM hardware key from secure fuses.
+    // The empty virtual profile uses this public label instead.
+    // A configured key is a declared input. The model does not infer its origin.
     static constexpr char oem_hw_key_label[] = "qcom-vp virtual GPCE OEM hardware key v1";
+    static int hex_nibble(char value) {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    }
+    static bool decode_hex_key(const std::string& encoded, unsigned char* output,
+                               std::size_t size) {
+        if (encoded.size() != size * 2) return false;
+        for (std::size_t i = 0; i < size; ++i) {
+            const int high = hex_nibble(encoded[2 * i]);
+            const int low = hex_nibble(encoded[2 * i + 1]);
+            if (high < 0 || low < 0) return false;
+            output[i] = static_cast<unsigned char>((high << 4) | low);
+        }
+        return true;
+    }
 
     // aes_cmac is the keyed AES-256 CMAC request. The others are plain hashes.
     enum class HashAlg { none, sha1, sha256, sha384, sha512, aes_cmac };

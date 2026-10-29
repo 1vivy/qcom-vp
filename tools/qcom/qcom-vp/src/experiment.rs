@@ -3,9 +3,9 @@
 //! The environment file declares the inputs, their identities, and the entry
 //! conditions. The platform Lua file remains the machine description, because
 //! this module does not parse or reproduce the QBox configuration. The module
-//! copies the declared inputs into the output, verifies their identities,
-//! starts the system executable with the snapshot, and records the process
-//! outcome.
+//! copies declared inputs and checks their identities. Optional state declarations
+//! select independent mutable files. Continuation copies a complete finished
+//! collection. The launcher starts the system and records its outcome.
 //!
 //! The platform script is trusted host code. It runs without a sandbox, so its
 //! external dependencies belong in the environment description. A successful
@@ -13,12 +13,15 @@
 //! hardware behavior. Guest-specific assertions belong to the experiment
 //! checker.
 
+mod state;
+
 use crate::{create_output, firmware, save_json, sparse, PlatformProcess};
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -39,8 +42,9 @@ const REMOVED: [&str; 2] = ["QCOM_VP_PLATFORM_DIR", "QCOM_VP_PROBE_ROOT"];
 /// States the limits of one execution record. Keep this text free of boot or
 /// qualification claims.
 pub const EVIDENCE_SCOPE: &str = "The platform script is trusted host code and runs \
-without a sandbox. The launcher sets QCOM_VP_ENV_ROOT and QCOM_VP_RUN_ROOT and \
-removes QCOM_VP_PROBE_ROOT and QCOM_VP_PLATFORM_DIR. Other host variables remain \
+without a sandbox. The launcher sets QCOM_VP_ENV_ROOT and QCOM_VP_RUN_ROOT. \
+It sets QCOM_VP_STATE_ROOT for declared persistent state and removes it otherwise. \
+It removes QCOM_VP_PROBE_ROOT and QCOM_VP_PLATFORM_DIR. Other host variables remain \
 inherited, so the environment is not hermetic. This record describes one process \
 execution. It does not establish kernel entry, boot success, physical hardware \
 behavior, or any security property.";
@@ -50,6 +54,8 @@ pub struct Options {
     pub out: PathBuf,
     pub system: Option<PathBuf>,
     pub timeout_seconds: u64,
+    pub resume_from: Option<PathBuf>,
+    pub clone_from: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +69,8 @@ struct Environment {
     security_policy: String,
     platform: String,
     files: Vec<FileInput>,
+    #[serde(default)]
+    state: Vec<state::Declaration>,
 }
 
 #[derive(Deserialize)]
@@ -91,7 +99,8 @@ impl Environment {
         for limitation in &self.limitations {
             require_text(limitation, "limitations")?;
         }
-        check_files(&self.files, &self.platform)
+        check_files(&self.files, &self.platform)?;
+        state::validate(&self.state, &self.files.iter().map(|file| file.name.as_str()).collect())
     }
 }
 
@@ -294,12 +303,23 @@ pub fn run(options: &Options) -> Result<()> {
     );
     let loaded = load_environment(&options.environment)?;
     let out = create_output(&options.out)?;
+    if !loaded.environment.state.is_empty() {
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o700))?;
+    }
     let started = Instant::now();
     let mut record = ResultRecord::new(&loaded, options.timeout_seconds);
     let mut failure = None;
     if let Err(error) = execute(&loaded, &out, options, &mut record) {
         record.error = Some(format!("{error:#}"));
         failure = Some(error);
+    }
+    if let Some(state) = record.state.as_mut() {
+        if let Err(error) = state::finish(&loaded, &out, state) {
+            record.error = Some(format!("{error:#}"));
+            if failure.is_none() {
+                failure = Some(error);
+            }
+        }
     }
     if record.outcome.is_empty() {
         record.outcome = "setup_error";
@@ -348,6 +368,12 @@ fn execute(
         sha256: firmware::hash(&system)?,
     });
     record.files = snapshot_inputs(&loaded.environment, &loaded.base, out)?;
+    if !loaded.environment.state.is_empty() || options.resume_from.is_some() || options.clone_from.is_some() {
+        record.state = Some(state::prepare(
+            loaded, out, record.system.as_ref().context("The system identity is absent")?,
+            options.resume_from.as_deref(), options.clone_from.as_deref(),
+        )?);
+    }
     let env_root = out.join(INPUTS);
     let platform = env_root.join(&loaded.environment.platform);
     record.invocation = Some(InvocationRecord {
@@ -356,6 +382,7 @@ fn execute(
         working_directory: out.display().to_string(),
         environment_root: env_root.display().to_string(),
         run_root: out.display().to_string(),
+        state_root: record.state.as_ref().map(|_| out.join(state::ROOT).display().to_string()),
         removed_environment: REMOVED.to_vec(),
         inherited_environment: inherited_environment(),
     });
@@ -376,6 +403,11 @@ fn execute(
         .stderr(stderr);
     for name in REMOVED {
         command.env_remove(name);
+    }
+    if record.state.is_some() {
+        command.env(state::VARIABLE, out.join(state::ROOT));
+    } else {
+        command.env_remove(state::VARIABLE);
     }
     let child = command.spawn();
     let mut child = match child {
@@ -433,6 +465,8 @@ struct ResultRecord {
     outcome: &'static str,
     environment: EnvironmentSummary,
     files: Vec<SnapshotRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<state::Record>,
     system: Option<SystemRecord>,
     invocation: Option<InvocationRecord>,
     timeout_seconds: u64,
@@ -472,7 +506,7 @@ struct SnapshotRecord {
     bytes: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct SystemRecord {
     path: String,
     sha256: String,
@@ -485,6 +519,7 @@ struct InvocationRecord {
     working_directory: String,
     environment_root: String,
     run_root: String,
+    state_root: Option<String>,
     /// Host variables that the launcher removed from the child.
     removed_environment: Vec<&'static str>,
     /// Inherited project variables that can still select host locations. The
@@ -496,7 +531,7 @@ fn inherited_environment() -> BTreeMap<String, String> {
     std::env::vars_os()
         .filter_map(|(name, value)| {
             let name = name.into_string().ok()?;
-            if REMOVED.contains(&name.as_str()) || name == ENV_ROOT || name == RUN_ROOT {
+            if REMOVED.contains(&name.as_str()) || name == ENV_ROOT || name == RUN_ROOT || name == state::VARIABLE {
                 return None;
             }
             if !name.starts_with("QCOM_VP_") && name != "PLATFORM_DIR" {
@@ -524,6 +559,7 @@ impl ResultRecord {
                 platform: loaded.environment.platform.clone(),
             },
             files: Vec::new(),
+            state: None,
             system: None,
             invocation: None,
             timeout_seconds,
@@ -562,6 +598,7 @@ mod tests {
             security_policy: "No authentication result is claimed.".to_owned(),
             platform: "platform.lua".to_owned(),
             files,
+            state: Vec::new(),
         }
     }
 
@@ -843,6 +880,8 @@ mod tests {
             out: out.clone(),
             system: None,
             timeout_seconds: 0,
+            resume_from: None,
+            clone_from: None,
         })
         .unwrap_err()
         .to_string();

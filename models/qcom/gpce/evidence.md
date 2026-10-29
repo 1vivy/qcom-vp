@@ -263,7 +263,7 @@ The result dump therefore carries the bytes in their natural order.
 
 The OEM hardware key comes from secure fuses on silicon.
 No capture provides it, and the model never reads a guest key word for it.
-The virtual OEM key is the SHA-256 digest of the public label
+The default virtual OEM key is the SHA-256 digest of the public label
 `qcom-vp virtual GPCE OEM hardware key v1`.
 Each run starts with an unprogrammed RPMB, so no device key must match it.
 
@@ -275,6 +275,25 @@ GOPROC_QC_KEY has no selected consumer and stays unmapped.
 The `qce-bam` fixture checks a nonfinal block, a final partial block, and a final full block.
 Python `cryptography` computes the expected values with the same virtual key.
 The fixture also checks both rejections.
+
+### Virtual OEM key input
+
+The model accepts the optional CCI parameter `oem_hw_key_hex`.
+The SoC platform wrappers apply it through `platforms/qcom/sm88xx/security-roots.lua`.
+Omit the field or set it to an empty string to keep the SHA-256 digest of the public label above.
+A nonempty value must contain exactly 64 hexadecimal characters.
+Do not add a `0x` prefix or whitespace. The model accepts uppercase and lowercase letters.
+The model decodes the characters to the 32-byte AES-256 key before simulation starts.
+
+The configured key applies only to OEM-key AES-256 CMAC requests.
+The request must use `USE_HW_KEY_AUTH` through `GOPROC_OEM_KEY`.
+Hash operations and the TME transport-key path do not use this value.
+The default public-label key and configured key remain in the QCE module across guest reset.
+A new simulator process initializes the key again from its profile.
+
+Both values enter the virtual model.
+The default value is public test material. An explicit value needs its own provenance.
+The profile does not export phone identity by default or prove compatibility with captured sealed objects.
 
 ### IV and byte-count byte order
 

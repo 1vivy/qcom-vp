@@ -47,6 +47,8 @@ public:
         "deny_rom_patch_authorization", false, "Deny all requests for ROM patch authorization"};
     cci::cci_param<bool> virtual_key_substitute{
         "virtual_key_substitute", false, "Enable the explicit virtual managed-key profile"};
+    cci::cci_param<std::string> virtual_root_hex{
+        "virtual_root_hex", "", "Optional exact 48-byte virtual managed-key root in hexadecimal"};
     cci::cci_param<std::string> transport_key_sink{
         "transport_key_sink", "", "HWKM slave object that receives the transport-key broadcast"};
 
@@ -124,15 +126,28 @@ private:
             throw std::invalid_argument("The sequencer requires ownership policy zero or one");
         }
         policy_ = policy_selection.get_value();
+        const auto& configured_root = virtual_root_hex.get_value();
+        if (!configured_root.empty() && !virtual_key_substitute.get_value()) {
+            throw std::invalid_argument(
+                "virtual_root_hex requires virtual_key_substitute=true");
+        }
         if (virtual_key_substitute.get_value()) {
-            // This public identity defines a virtual device, not a physical device secret.
-            static constexpr unsigned char identity[] = "qcom-vp virtual TME managed-key profile v1";
-            SequencerSha384 hash;
-            hash.initialize(nullptr, 0);
-            hash.update(identity, sizeof(identity) - 1);
-            hash.finalize(virtual_root_.data());
+            if (configured_root.empty()) {
+                // This public identity defines a virtual device, not a physical device secret.
+                static constexpr unsigned char identity[] = "qcom-vp virtual TME managed-key profile v1";
+                SequencerSha384 hash;
+                hash.initialize(nullptr, 0);
+                hash.update(identity, sizeof(identity) - 1);
+                hash.finalize(virtual_root_.data());
+            } else if (!decode_root_hex(configured_root, virtual_root_.data(),
+                                        virtual_root_.size())) {
+                throw std::invalid_argument(
+                    "virtual_root_hex must contain exactly 96 hexadecimal characters");
+            }
             std::cerr << "SEQUENCER_KEY_SUBSTITUTE root_slot=9 owner=2"
-                         " policy=managed-hmac root=public-virtual-identity\n";
+                      << " policy=managed-hmac root="
+                      << (configured_root.empty() ? "public-virtual-identity" : "explicit-profile")
+                      << '\n';
         }
         if (!transport_key_sink.get_value().empty()) {
             transport_key_sink_ =
@@ -154,6 +169,23 @@ private:
     static std::uint32_t load_word(const unsigned char* data) {
         return std::uint32_t{data[0]} | (std::uint32_t{data[1]} << 8) |
             (std::uint32_t{data[2]} << 16) | (std::uint32_t{data[3]} << 24);
+    }
+    static int hex_nibble(char value) {
+        if (value >= '0' && value <= '9') return value - '0';
+        if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+        if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+        return -1;
+    }
+    static bool decode_root_hex(const std::string& encoded, unsigned char* output,
+                                std::size_t size) {
+        if (encoded.size() != size * 2) return false;
+        for (std::size_t i = 0; i < size; ++i) {
+            const int high = hex_nibble(encoded[2 * i]);
+            const int low = hex_nibble(encoded[2 * i + 1]);
+            if (high < 0 || low < 0) return false;
+            output[i] = static_cast<unsigned char>((high << 4) | low);
+        }
+        return true;
     }
 
     static void store_word(unsigned char* data, std::uint32_t value) {

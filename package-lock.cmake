@@ -30,7 +30,8 @@ set(QCOM_VP_LIBQEMU_PATCHES
   "${CMAKE_CURRENT_LIST_DIR}/patches/libqemu/0026-implement-ufs-rpmb.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/libqemu/0027-expose-pmu-counter-count.patch"
   "${CMAKE_CURRENT_LIST_DIR}/patches/libqemu/0028-add-bulk-memory-access.patch"
-  "${CMAKE_CURRENT_LIST_DIR}/patches/libqemu/0029-implement-qcom-amu.patch")
+  "${CMAKE_CURRENT_LIST_DIR}/patches/libqemu/0029-implement-qcom-amu.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/patches/libqemu/0030-persist-ufs-rpmb.patch")
 if(NOT COMMAND CPMDeclarePackage)
   return()
 endif()
@@ -174,4 +175,8 @@ CPMDeclarePackage(qemu
     COMMAND ${CMAKE_COMMAND}
     -DSOURCE=<SOURCE_DIR>
     -DPATCH=${CMAKE_CURRENT_LIST_DIR}/patches/libqemu/0029-implement-qcom-amu.patch
+    -P ${CMAKE_CURRENT_LIST_DIR}/cmake/ApplyPatch.cmake
+    COMMAND ${CMAKE_COMMAND}
+    -DSOURCE=<SOURCE_DIR>
+    -DPATCH=${CMAKE_CURRENT_LIST_DIR}/patches/libqemu/0030-persist-ufs-rpmb.patch
     -P ${CMAKE_CURRENT_LIST_DIR}/cmake/ApplyPatch.cmake)

@@ -33,6 +33,8 @@ return function(p, o)
     assert(o.rpmb_size_kib == nil or (type(o.rpmb_size_kib) == 'number' and o.rpmb_size_kib % 128 == 0
            and o.rpmb_size_kib >= 0 and o.rpmb_size_kib <= 255 * 128),
            'The RPMB size must be a multiple of 128 KiB up to 32640 KiB.')
+    assert(o.rpmb_state_file == nil or (type(o.rpmb_state_file) == 'string'
+           and not o.rpmb_state_file:find('%z')), 'The RPMB state path is invalid.')
     p.ufs_instance = {
         moduletype = 'QemuInstance', args = {'&' .. (o.manager or 'qemu_inst_mgr'), 'AARCH64'},
         accel = 'tcg', sync_policy = 'multithread-quantum'
@@ -46,6 +48,7 @@ return function(p, o)
         virtual_phy = o.virtual_phy == true,
         boot_enable = o.boot_enable, boot_lun_en = o.boot_lun_en,
         rpmb_size_kib = o.rpmb_size_kib or 0,
+        rpmb_state_file = o.rpmb_state_file or '',
         target_socket = {address = 0x01d84000, size = 0x3000,
                          bind = '&' .. o.router .. '.initiator_socket'},
         -- GCC_UFS_PHY_BCR is defined at GCC offset 0x77000.

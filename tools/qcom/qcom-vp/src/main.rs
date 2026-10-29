@@ -118,6 +118,12 @@ enum Action {
         system: Option<PathBuf>,
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         timeout_seconds: u64,
+        /// Continue from the complete persistent state of a finished run.
+        #[arg(long, conflicts_with = "clone_from")]
+        resume_from: Option<PathBuf>,
+        /// Copy a finished environment with its identity and persistent state.
+        #[arg(long, conflicts_with = "resume_from")]
+        clone_from: Option<PathBuf>,
     },
     /// Check evidence references in root Markdown, docs, and models against the manifest.
     References {
@@ -823,6 +829,10 @@ fn run(prepared_root: &Path, out: &Path, options: RunOptions) -> Result<()> {
         config.push_str(&format!("  [{}] = {},\n", lun.lun, lun.boot_lun_id));
     }
     config.push_str(" },\n");
+    config.push_str(&format!(
+        " oem_hw_key_hex = board.oem_hw_key_hex,\n virtual_root_hex = board.virtual_root_hex,\n rpmb_size_kib = board.rpmb_size_kib,\n rpmb_state_file = board.rpmb_size_kib == 0 and '' or {},\n",
+        lua_string(&out.join("rpmb.state"))?
+    ));
     if let Some(runtime) = &prepared.tme_runtime {
         config.push_str(&format!(
             " tme_runtime_api_map = {},\n",
@@ -1092,11 +1102,15 @@ fn main() -> std::process::ExitCode {
             out,
             system,
             timeout_seconds,
+            resume_from,
+            clone_from,
         } => experiment::run(&experiment::Options {
             environment,
             out,
             system,
             timeout_seconds,
+            resume_from,
+            clone_from,
         }),
         Action::References { repo, manifest } => {
             references::run(&references::Options { repo, manifest })
