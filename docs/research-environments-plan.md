@@ -220,6 +220,65 @@ A change to the allowed authentication policy needs an explicit, documented deci
 
 Deliverable: migrated reference environments with procedures that demonstrate their stated contracts.
 
+### B3a. Reconstruct required state and contents
+
+An environment needs coherent contents as well as device interfaces and parameters.
+A successful boot does not qualify every service that the firmware publishes.
+Qualification follows the research function, its consumers, and their required state.
+
+The state review covers these surfaces:
+
+| Surface | Required relationships |
+| --- | --- |
+| RPMB and secure files | Geometry, records, ownership, integrity, rollback state, initialization, and persistence |
+| KeyMint, RKP, and StrongBox | Provisioning, protected key blobs, certificate chains, service dependencies, and lifecycle |
+| EFI variables and boot policy | Values, formats, defaults, validation, and firmware decisions |
+| Persistent partitions and OEM records | Required contents, optional contents, producers, and update rules |
+| Shared memory and firmware handoffs | Structures, ownership, validity, publication order, and consumer expectations |
+| Hardware identity and key services | Derivation inputs, policy, validation, and the effects of virtual substitutes |
+
+The review first uses existing models and evidence.
+The review must distinguish missing behavior from missing documentation or an untested service.
+It must not assume that every state surface needs replacement.
+
+For each selected research function:
+
+1. Identify the consumer and its required initial state.
+2. Trace that state to its producer, backing store, and validation rules.
+3. Inspect relevant contents through an authorized observation path.
+4. Record the input identity, checkpoint, interpretation, and consistency limits.
+5. Compare the observation with current model parameters and contents.
+6. Select captured inputs, firmware-generated state, or an explicit virtual profile.
+7. Exercise the function with coherent state and effective failure checks.
+8. Repeat the experiment from its declared initial condition.
+
+Authorized research can inspect device-specific contents when they answer the selected question.
+The observation boundary is not metadata versus contents.
+Private capture and public distribution are separate decisions.
+Relevant unique material remains private unless its release receives separate authorization.
+Analysis outputs must not disclose secret values when structural results suffice.
+Research authorization does not permit destructive changes or grant access to unrelated data.
+The [hardware campaign](qcom/sm88xx/oplus/infiniti/hardware-probe-plan.md) defines the device-operation boundary.
+
+Captured objects can depend on hardware secrets, counters, firmware versions, or other records.
+A copied encrypted object does not establish a usable virtual input.
+A research profile must keep keys, certificates, counters, identities, and policy consistent.
+Test identities must remain distinguishable from retail identities.
+Unknown contents must not become guessed certificates, successful authorization, or unexplained completion records.
+
+The implementation can use four sources of state:
+
+| Source | Acceptance condition |
+| --- | --- |
+| Observed device contents | The capture identifies its consumer, context, and portability limits. |
+| Firmware-generated contents | A repeatable procedure establishes the required state through real firmware behavior. |
+| Constructed research profile | Evidence supports the formats and relationships, with explicit test identities and limits. |
+| Private device-bound inputs | The experiment establishes their required dependencies without claiming general portability. |
+
+Deliverable: a state inventory that maps each selected function to supported contents, unresolved dependencies, and execution evidence.
+An environment can qualify a bounded function without reproducing the whole device.
+An interface census or boot milestone alone cannot qualify that function.
+
 ### B4. Qualify the reworked environments
 
 A result such as a later boot milestone is an observation, not proof of every preceding model.

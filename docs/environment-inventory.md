@@ -62,6 +62,47 @@ The platform still reports the deliberate unmapped access as a process failure.
 A separate checker establishes the narrower experiment result from the observed address and execution outcome.
 This does not establish OEM firmware execution, retail authentication, physical interrupt timing, or an EL2 escalation.
 
+## State and content contracts
+
+The [state reconstruction plan](research-environments-plan.md#b3a-reconstruct-required-state-and-contents) covers required contents, not only interfaces.
+The current environment contains functional state, but each research function needs its own qualification.
+
+| Surface | Current contract | Remaining qualification |
+| --- | --- | --- |
+| UFS media | Preparation imports package contents. Each run receives independent mutable LUN copies. | Device-specific records and intentional reuse of prior state need a coherent input profile. |
+| RPMB | The reference declares 4 MiB. The key, counter, and data persist within one run. Each new run begins unprogrammed. | Provisioned contents, region allocation, and persistence across runs remain separate requirements. |
+| Hardware keys and identity | The composition supplies explicit virtual identity, policy, and key substitutes. | Captured sealed objects need compatible derivation inputs and validation, not only matching filenames. |
+| Secure files | Selected firmware uses filesystem listeners and protected persistent objects. | The object format, version relationships, integrity checks, and owning service need qualification together. |
+| RKP and trusted services | Published interfaces and firmware execution establish bounded availability. | Provisioning, certificate use, trusted-app persistence, StrongBox, and AVF need separate consumer experiments. |
+| EFI and boot policy | Package media and guest writes supply state. Private records distinguish EFI variables from Keymaster DeviceInfo. | Initialization, authoritative values, durable backing, and reset survival need distinct evidence. |
+| Shared handoffs | Firmware produces records in shared model memory. Existing physical captures identify selected structures and queue geometry. | A warm-state profile must preserve ownership and validity. Historical pointers and capabilities are not reset constants. |
+
+The [storage evidence](../models/qcom/ufs/README.md#authenticated-rpmb) defines the RPMB operations and their limits.
+The [substitute inventory](qcom/sm88xx/stubs.md) identifies virtual keys and identity.
+The [hardware evidence](qcom/sm88xx/oplus/infiniti/hardware-evidence.md#shared-ram) separates captured handoff contents from reset behavior.
+
+Selected CPH2747 captures establish useful structure without qualifying a complete provisioned environment.
+The RPMB unit reports 16 MiB, while its region allocation remains unresolved.
+Two secure-file indexes use an 88-byte prefix and 25-byte entries.
+The matching TZ image uses that entry layout with a configurable capacity.
+The captured capacity is 60 entries, not a universal hardware constant.
+
+Three active index words match fields in their respective objects.
+Primary and backup objects differ, and one backup index references a primary object version-like field.
+These relationships rule out an assumption that every backup index selects every backup object.
+Their authentication and commit semantics still require a matched consumer analysis.
+
+The captured RKP database contains no provisioned-key rows.
+That observation does not establish that all device credential stores are empty.
+Private captures and the offline interpreter preserve the evidence without adding device payloads to the repository.
+
+The private records separate observations, static firmware facts, and remaining dependencies:
+
+- Reconciliation: `artifacts:2026-10-29-environment-state/findings.json sha256=3df154195c9cf61cacef170c733dc9cb36c51ba7bc2814d922ff92c022195b17`.
+- Content interpretation: `artifacts:2026-10-29-environment-state/interpreted.json sha256=85c95db46459939df6b3eaa2a93d23aa6aa536068df6d4c3a76afde5d00e24e9`.
+- Matched firmware: `artifacts:2026-10-29-environment-state/firmware-facts.json sha256=e95335ec81b3c4784cb483a91b06c65229b0666261b0729524c4438a37b7b8b5`.
+- Offline interpreter: `artifacts:2026-10-29-environment-state/inspect-captures.py sha256=7087dd17c2a2534bdf5bf4a749a28d4f16fbae4417dc8d0b033075ab0a59cd8a`.
+
 ## Hidden dependencies and disposition
 
 | Dependency | Disposition |
