@@ -392,6 +392,175 @@ Retained evidence:
 - Active instrument: `artifacts:2026-10-29-software-key-cmac/active-provider.py sha256=9161641fe600c31293ffa3ff6e7e22e9a08fb397432b57fd3b5dda5026febc87`.
 - Startup limits: `artifacts:2026-10-29-software-key-cmac/prerequisite-failures.json sha256=f02d7355c403c3f8b8dbc9ebd6dece0abe3c8c1e5758cff6156cb4cd745449ea`.
 
+### Nonsecure client transport and object contracts
+
+A nonsecure client reaches QTEE through two layers: the `smcinvoke` driver and the QCOM SCM invoke service.
+The [OnePlus driver interface](https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8850/blob/5ab2a689ff87d7d28c511f1762cf41c1b90d965a/vendor/qcom/opensource/securemsm-kernel/include/uapi/linux/smcinvoke.h) defines the ioctl request, argument union, and callback structures.
+The [SI client](https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8850/blob/5ab2a689ff87d7d28c511f1762cf41c1b90d965a/vendor/qcom/opensource/securemsm-kernel/smcinvoke/si_core_xts/smci.c) and [compatibility client](https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8850/blob/5ab2a689ff87d7d28c511f1762cf41c1b90d965a/vendor/qcom/opensource/securemsm-kernel/smcinvoke/compat/smcinvoke.c) define handles and object lifetime.
+The [OnePlus SCM call](https://github.com/OnePlusOSS/android_kernel_oneplus_sm8850/blob/fc30e54174d254ff7f33622a9278e4435f6718d2/drivers/firmware/qcom/qcom_scm.c) and [register setup](https://github.com/OnePlusOSS/android_kernel_oneplus_sm8850/blob/fc30e54174d254ff7f33622a9278e4435f6718d2/drivers/firmware/qcom/qcom_scm-smc.c) define service identifiers and return registers.
+The [object header](https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8850/blob/5ab2a689ff87d7d28c511f1762cf41c1b90d965a/vendor/qcom/opensource/securemsm-kernel/include/linux/smcinvoke_object.h) defines counts and error codes.
+
+These revisions publish OnePlus 15 release `16.0.9.400` for CPH2745, CPH2747, and CPH2749.
+They date from July 2026, while the earlier Google securemsm reference dates from April 2024.
+The UAPI, client-environment, object, and opener headers have identical Git blob IDs in both sources.
+The SI kernel wrapper also matches, but the two main client implementations differ.
+The comparison does not identify the compiled configuration of the selected `16.0.5.700` firmware.
+
+The OnePlus securemsm subtree is `22c99ed40b699512f8244f0cccd23268b5af0d54`.
+It also matches the branch's November 2025 initial import.
+The July release names Qualcomm tag `AU_LINUX_ANDROID_LA.VENDOR.16.2.0.R1.11.00.00.1277.078` for securemsm.
+The matching kernel names tag `AU_LINUX_KERNEL.PLATFORM.5.0.R1.00.00.00.099.064`.
+These source identities establish lineage, not secure-firmware policy or physical-device behavior.
+
+#### Transport framing
+
+The following framing describes the selected ARM64 standard SCM path.
+The compatibility backend also supports a legacy command.
+SCM can select a HAB-mediated conduit from device-tree configuration.
+Source availability alone does not establish the active backend.
+
+1. The caller issues an SMC64 standard call with owner 50, function `(0x06, 0x02)`, and argument information `0x224`.
+2. The four arguments are the inbound address, inbound size, outbound address, and outbound size. Both sizes are page multiples.
+3. The reply returns transport status in `a0`, response type in `a1`, object result in `a2`, and data in `a3`.
+4. The transport handles interrupted calls and wait-queue statuses before it maps a final error to a negative errno.
+5. A callback response uses function `(0x06, 0x01)`, argument information `0x22`, and the outbound buffer address and size.
+6. The inbound buffer starts with a 12-byte header of handle, operation, and counts.
+7. The header precedes an argument array of 8-byte slots. A buffer slot holds an offset and a size. An object slot holds a 32-bit handle.
+8. Payloads follow the array at 8-byte alignment. The counts field packs buffers-in, buffers-out, objects-in, and objects-out in four nibbles.
+9. Operation `0xffff` is release. Operation `0xfffe` is retain.
+
+The [SI allocator](https://github.com/OnePlusOSS/android_kernel_oneplus_sm8850/blob/fc30e54174d254ff7f33622a9278e4435f6718d2/drivers/firmware/qcom/si_core/si_core.c#L443-L491) aligns both buffers to pages.
+It rounds the variable inbound allocation to a page multiple and allocates 32 KiB for the outbound buffer.
+The bounded firmware probes below use smaller buffers and do not reproduce that allocator.
+The [SI adapter](https://github.com/OnePlusOSS/android_kernel_oneplus_sm8850/blob/fc30e54174d254ff7f33622a9278e4435f6718d2/drivers/firmware/qcom/si_core/qcom_scm_invoke.c) owns busy retries outside the no-retry SCM call.
+
+#### Root environment and object lifetime
+
+- Userspace opens `/dev/smcinvoke`. The open file holds the shared root object with handle one.
+- The ioctl argument union has 24 bytes, distinct from an 8-byte wire slot. The driver rejects a different argument size.
+- Both userspace backends refuse root operations 4, 8, and 9.
+- Userspace operation 5 requires counts `(0,0,1,1)` and a nonnull credential object.
+- The kernel client uses operation 5 with a null credential object through its kernel object interface.
+- The [registration interface](https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8850/blob/5ab2a689ff87d7d28c511f1762cf41c1b90d965a/vendor/qcom/opensource/securemsm-kernel/include/linux/IClientEnv.h) defines four distinct operations.
+- Operation 1, `registerLegacy`, takes a credential buffer and uses counts `0x1001`.
+- Operation 2, `register`, takes a credential object and uses counts `0x1100`.
+- Operation 3, `registerWithWhitelist`, also takes a UID array and uses counts `0x1101`.
+- Operation 5, `registerWithCredentials`, takes a credential object and uses counts `0x1100`.
+- The client environment serves operation 0 (`open`) with a 4-byte UID buffer and one output object. UID zero is not valid.
+- A returned object becomes a file descriptor. The descriptor owns the reference, and its close releases the object.
+- The root object is indestructible. The driver rejects its export and skips its release.
+- Kernel clients process retain and release in the local object table. A userspace client must keep the descriptor to keep the object.
+
+#### Buffer ownership and address translation
+
+- The interface passes user virtual addresses. The driver copies the bytes into kernel memory or into page-aligned shared memory.
+- The secure side receives offsets into the shared buffer or its physical address. It never receives a user address.
+- The driver copies output bytes back only when the object result is zero.
+- Memory objects are DMA-BUF references. The compatibility driver encodes a handle with a local bit, a 15-bit object identifier, and a 16-bit server identifier.
+- The SI backend instead allocates object IDs with the nonsecure bit set. Its encoding does not use the compatibility split.
+- Object arguments carry handles, never pointers.
+
+#### Error domains
+
+| Layer | Value | Meaning |
+| --- | --- | --- |
+| ioctl | `0` | The request completed. Read the object result. |
+| ioctl | Negative errno | Argument, copy, memory, or descriptor failure in the driver. |
+| SMC | `a0 = 0` | The transport completed. `a2` holds the object result. |
+| SMC | `a0 != 0` | The transport returned a nonzero status. The public client treats the object result as invalid. |
+| Object | `0` | Success. |
+| Object | `1` to `4` | General error, invalid request, input size, output size. |
+| Object | `10` and above | Caller-defined codes. |
+| Object | `-90` through `-99`, and `-103` | Named transport object errors. The header does not define every intervening value. |
+
+#### Executed transport observation
+
+Five bounded runs use the same caller logic, selected TZ image, system executable, and prepared inputs.
+They compare ID9 at EL2, an authored EL1 continuation, and the QHEE handoff at EL1.
+The ID9 scratch window starts at `0xe0000000`, while the QHEE scratch window starts at `0xf0000000`.
+The debugger reads the guest view of memory.
+
+| Boundary | Observation |
+| --- | --- |
+| ID9 SMC delivery | The call traps to the TZ EL3 vector at `0x1468fc00`. `VBAR_EL3` reads `0x1468f800`. The vector literal names handler `0xd820cbc8`. |
+| QHEE SMC delivery | The call traps to EL2 at `VBAR_EL2 + 0x400` in mode EL2h. The trap and handler bytes match the selected `hypvm.mbn` at its `0x2c00` and `0x2400` offsets. The hypervisor path then enters the TZ EL3 vector at `0x1468fc00` and handler `0xd820cbc8`. |
+| ID9 continuation, EL2 | Every object request returns the 32-bit value `0x80000001` in `a0`. The register holds `0xffffffff80000001`. The inbound and outbound pages stay unchanged. |
+| ID9 then authored EL1 handoff | The guest reports `CurrentEL` one. Every object request returns the same `0x80000001`. The pages stay unchanged. |
+| ID9 continuation, EL2 | The call-availability probe returns `-1`. This result differs from the object requests for a different function identifier. |
+| QHEE to UEFI entry, EL1 | The QSEECOM version query returns `0` in `a0`. The first result register reads `0x1402000`. |
+| QHEE to UEFI entry, EL1 | `register` with null credentials returns `0` and exports object two. |
+| QHEE to UEFI entry, EL1 | `registerWithCredentials` with a null object returns `0` and exports object three. |
+| QHEE to UEFI entry, EL1 | `open` on the root object returns object result `2` for UID zero. |
+| QHEE to UEFI entry, EL1 | `open` on the environment returns object result `11` for UID `0x0b` and for UID `0x91`. The interpretation is provisional. |
+| QHEE to UEFI entry, EL1 | `retain` and `release` on the environment return object result `-92`. |
+| QHEE to UEFI entry, EL1 | `open` on the environment still dispatches after a failed retain. |
+
+The ID9 refusal remains at both tested exception levels.
+The authored EL1 handoff uses the same caller logic, buffer layout, and TZ image.
+The uniform `0x80000001` result also applies to a call with immediate arguments only, so the refusal is not a message-layout effect.
+The two paths differ before EL3. At ID9 the SMC enters the TZ EL3 vector directly, and TZ refuses it.
+After QHEE the same SMC enters the hypervisor at EL2 first. The hypervisor then enters the same TZ EL3 vector and handler, and the call returns success.
+The trap vector and handler bytes match the selected `hypvm.mbn` and `tz.mbn` images.
+The `hypvm.mbn` image has SHA-256 `1a480f0020c95fa1432f88e13543a6ebcc9521f0d3d3d67975a93cd861c9af6e`.
+TZ is therefore in both paths. We did not establish which component decides the refusal, and the hypervisor stage is not modeled by this repository.
+The object results use the public object table for `2` and `-92`.
+The value `11` equals the privilege code in the public opener header. We did not check that the client environment uses that table.
+We also did not establish which branch returned `11`. It may be an invalid-handle dispatch.
+
+#### Forwarded call metadata
+
+The QHEE path preserves the client function identifier, argument information, and arguments.
+For the version query the EL2 trap, the EL3 vector, and the saved handler frame hold `x0=0x42000603`, `x1=0x1`, and `x2=0xa`.
+For `register` they hold `x0=0x72000602`, `x1=0x224`, and `x2..x5=0xf0001000`, `0x1000`, `0xf0002000`, `0x1000`.
+The saved frame at handler `0xd820cbc8` reproduces the same block.
+The hypervisor sets `x7` to `3` and changes `x9` to a pointer. `VTTBR_EL2` carries VMID `3` in the same call. We did not qualify the relation between `x7` and the VMID.
+The EL3 entry reports `ESR_EL3` exception class `0x17`, `SPSR_EL3` mode EL2h, and `ELR_EL3` inside the hypervisor.
+`VTTBR_EL2` reads `0x30008bd900000` with `HCR_EL2=0x30c807d003b`.
+The direct ID9 EL1 call enters the same vector with `x0..x5` equal to the caller, `x7=0`, `SPSR_EL3` mode EL1h, `VTTBR_EL2=0`, and `HCR_EL2=0x80000000`.
+Both paths pass the same buffer addresses in the caller view. The hypervisor does not remap them before EL3.
+A direct EL1 control sets `x7=3` and keeps every other field. The TZ EL3 vector receives `x7=3`, and the version query still returns `0x80000001`.
+The `x7` value alone therefore does not admit the call. Its meaning remains unknown.
+An implementable first transaction supplies the standard client SMC, the page addresses, and the caller context that the secure policy requires.
+A producer of that context must supply the required value. This section does not recommend a fixed `x7` for other callers.
+The remaining differences include the caller origin, preceding stage, and secure state that QHEE establishes.
+
+#### Contract limits and next prerequisite
+
+- The caller is an authored nonsecure SMC client. It is not the Linux driver, and it holds no descriptor table.
+- The caller sends null credentials. It loads no TEE application and reaches no KeyMint or protected-file operation.
+- The UID opens return a refusal from the secure side. Their interpretation as an authorization decision is provisional.
+- The transport observations qualify framing, root registration, environment open admission, and the refusal paths.
+- They do not qualify descriptor lifetime, callback service, memory objects, or a successful service open.
+- The hypervisor stage between EL1 and the TZ EL3 vector is original firmware, not a modeled service.
+- The `invoke-callback-response` probe used the invoke function with two arguments. It is a malformed invoke negative. No callback-response transaction occurred.
+- The remaining prerequisite for a service transaction is a registered client environment that admits the target UID.
+- We did not qualify the environment identity, the admitted operation set, or the origin of the `11` refusal.
+- The next discriminator is operation 1 with a real credential buffer. The kernel descriptor path is an alternative.
+- A read-only query on an admitted UID follows either path.
+- Root and open readiness are separate from KeyMint and protected-file lifecycle readiness.
+
+Retained evidence:
+
+- ID9 refusal: `artifacts:2026-10-30-secure-client-contracts/result-id9.json sha256=ea9c6218546a08516a81c9f7f790690f658eba5c3dca204b8a59dec9cd4b5a9a`.
+- ID9 EL1 control: `artifacts:2026-10-30-secure-client-contracts/result-id9-el1.json sha256=a3c35074034eea67076c9a3f019b7aecafe13ec0b58e828e0cd8c3832ab14acf`.
+- EL1 caller: `artifacts:2026-10-30-secure-client-contracts/observe-client-id9-el1.py sha256=77b52bcf9ff1d00cb544ee81b3265a8f8ff9c48fcfa9bec29322037515f55cdb`.
+- QHEE probes: `artifacts:2026-10-30-secure-client-contracts/result-qhee-probes.json sha256=6aef5c0a22d1adc4f8d0b478b535193ba06289640fad317edb108cd1dd3c6378`.
+- QHEE SMC trail: `artifacts:2026-10-30-secure-client-contracts/result-qhee-smc-trace.json sha256=a577aaa5d8d2f80c4ac2f069b09874f35b838c73692940a2d9b777da127db6b6`.
+- QHEE endpoint bytes: `artifacts:2026-10-30-secure-client-contracts/result-qhee-endpoint-trace.json sha256=6bcb840c52aee3cbba5b1c127ab775cd2e650f95bebd4717d6a227862fa4163a`.
+- QHEE EL3 confirmation: `artifacts:2026-10-30-secure-client-contracts/result-qhee-el3-confirm.json sha256=a4629f0cfc3bba4282ede8f85143ac6c5eef3ddb6a8fb48d23c0f3067ecf2388`.
+- QHEE forwarding metadata: `artifacts:2026-10-30-secure-client-contracts/result-qhee-forwarding.json sha256=25a1a923c1451d05cb14fb2831823d488b0cab18b44227909643551f4bb4a27b`.
+- Forwarding instrument: `artifacts:2026-10-30-secure-client-contracts/observe-client-forward.py sha256=4709a186a1301faaa12c9c80ec9817e518407da8b471a687d883dd80eee2fe24`.
+- ID9 direct vector registers: `artifacts:2026-10-30-secure-client-contracts/result-id9-direct-vector.json sha256=d48c3d1b1bf58969c63c1f995e1da53272865ee79029597105086f286ac94ad6`.
+- ID9 `x7=3` control: `artifacts:2026-10-30-secure-client-contracts/result-id9-x7-3.json sha256=67b5b13ad802d4b0433cfac1af9e6b40f5c295b372e31be6cc77558c34d3b40f`.
+- Direct-vector instrument: `artifacts:2026-10-30-secure-client-contracts/observe-client-direct.py sha256=e67f96cd69a1acc66dbc0c259e3d47f97dbe5787600105445df0759cb0306d3a`.
+- Endpoint instrument: `artifacts:2026-10-30-secure-client-contracts/observe-client-endpoint.py sha256=eb68f3896a545d9498cd7011ae27c0e38b4504eb14ef3fb2065745562ee7254b`.
+- EL3 instrument: `artifacts:2026-10-30-secure-client-contracts/observe-client-el3.py sha256=19fe403fe5b8d3e2d46018140c125984d0510c2f9df30791cc443bcaf95c8b5a`.
+- QHEE object chain: `artifacts:2026-10-30-secure-client-contracts/result-qhee-chain.json sha256=56fa1322cb450720b105b985f2f3abe5d7c993d8f841615596caf3a8acdc3de9`.
+- QHEE lifetime probes: `artifacts:2026-10-30-secure-client-contracts/result-qhee-lifetime.json sha256=c69010c8a37601bbedabb2dbf9f14b44178966138c0cf218f38c895b92881102`.
+- ID9 caller: `artifacts:2026-10-30-secure-client-contracts/observe-client-id9.py sha256=801f62ca4fc0c2f972762584b255df10d3b80ee02bc5e24a96fc69107ba4384b`.
+- QHEE caller: `artifacts:2026-10-30-secure-client-contracts/observe-client-qhee.py sha256=de1e63187785785aa6a5edd4446801d2feedf44598938c71f33c8793724ac9e7`.
+- Vendor source comparison: `artifacts:2026-10-30-secure-client-contracts/vendor-source-review.json sha256=7f18eea9309127d16cc550e4628470a897c69be6dcc6427962f068b8de03ed50`.
+
 ## Hidden dependencies and disposition
 
 | Dependency | Disposition |
