@@ -1415,8 +1415,8 @@ It loads the driver table from CPU descriptor `+0x10`.
 It calls the method at driver `+0x28` with the descriptor, the state argument, and a table pointer.
 Run406 executes `0x1573e870..0x1573e998` between that call and the poll.
 That range is the executed wake body.
-The trace does not capture the table value at driver `+0x28`.
-This note does not claim `0x1573e870` as that value.
+The run406 trace did not capture the table value at driver `+0x28`.
+The later grouped observation below identifies that method as `0x1573e870`.
 
 `0x1573e870` tests bit 29 of `0x17090100 + cpu*0x40000`.
 That word is GICR_ISENABLER0.
@@ -1463,16 +1463,21 @@ These sites are from the SM8850 package.
 This note does not inspect the SM8845 PDP image.
 The SM8845 TZ contains the same poll sequence, so the block values are the same.
 
-The model does not execute PDP firmware.
-The CPU domain publishes the same header through the optional `boot_status_socket`.
+The earlier composition did not execute PDP firmware.
+Its CPU domain published the header through the optional `boot_status_socket`.
 `platforms/qcom/sm88xx/pdp-scmi.lua` adds two `addrtr` aliases at `0x81f5a000` and `0x81f9a000`.
 Each alias forwards to the existing DDR owner, so no RAM overlay exists.
-The native runtimes pass `cpu_domain='cpu_domains'` to that helper.
+That composition passed `cpu_domain='cpu_domains'` to the helper.
 A PDP-only fixture omits the option and skips the publication.
 The domain writes the header after a lane initializes and on each release command.
 The bitmap reports cores that are attached, powered, and out of reset.
 The model writes bits 16..23 only. The other PDP bitmap bits stay zero.
 This is a functional completion record. It is not an authentication claim.
+
+The current `platforms/qcom/sm88xx/pdp-runtime.lua` executes the original PDP firmware.
+It sets `cpu_domains.boot_status_enable=false`.
+Only the PDP guest publishes the boot status in that composition.
+The optional domain publisher remains a separate functional substitute, not evidence of PDP execution.
 
 ## Cluster bring-up publication words
 
@@ -1519,7 +1524,9 @@ It contains no ESR, FAR, or ELR record table there.
 The recorder at `0x146942c4..0x14694abc` is the architectural vector body.
 It takes no separate fault record that this run exposes.
 
-## Next prediction
+## Historical run407 prediction
+
+The following predictions describe run407, not the current execution boundary.
 
 Run407 passes the wake poll and reaches the cluster bring-up.
 The two retained words should let `0x1573ed44` finish and return zero.
@@ -1529,6 +1536,136 @@ The APSS trace should then show TZ warm-entry translation blocks.
 
 The next candidate stop is the per-lane LPM method at driver `+0x8` if it returns an error.
 That error path logs the LPM synchronize lock failure at `0x157d0ae2`.
-The secure SCMI cluster path remains unmodeled and can stop later work.
+At that checkpoint, the secure SCMI cluster path remained unmodeled and could stop later work.
 
+
+## Grouped CPU qualification through ID9
+
+The bounded SM8850 experiment observes the complete boot-core sequence through the ordinary ID9 entry.
+It changes only the existing boot-record selector from slot 22 to slot 23.
+Original TZ enters `0xc6800000` at nonsecure EL2.
+The observer stops before that image executes.
+The experiment changes no firmware instruction, loaded-image inventory, or authentication result.
+
+The selected TZ SHA-256 is `afdfaf27b33616718249ac857b7021001f33fe767c74c6e877cd280a3ee99932`.
+The selected XBL SHA-256 is `b5f4891e7e217d2ae105d1b881741bd0d20eac8a68b7c3551d444c3e178aef9a`.
+The system SHA-256 is `33319a6652cd149e2f50a393843aa3467c179b92f1df20361fb2518600c09686`.
+The observation records the package, prepared-input, and run hashes separately.
+Source addresses below use the TZ ELF view, not relocated execution addresses.
+
+### Producer state and execution order
+
+| Boundary | Observed input or effect | Required contract |
+| --- | --- | --- |
+| Original TZ entry `0x1468e034` | `SCR_EL3=0xe38`, `CPTR_EL3=0x1100`, `MPAM3_EL3=0xc000000000000000` | Preserve inherited controls. Let original TZ change them. |
+| Vector store `0x157bef3c` | Lane zero receives `0x1468e000` at `0x19880328` | Retain the vector. Publication alone does not reset a running CPU. |
+| Secure handshake `0x15759130..0x1575915c` | CPUCP publishes `INIT`. QSEE copies it to the acknowledgement. | Share the actual marker storage. |
+| Secure submission `0x15759188` | Header `0x4404`, payload `(0,0,0x13000)` | Separate submission from notification and service completion. |
+| Power method `0x1573e608` | Core zero, lane zero, power base `0x19880000` | Resolve the descriptor, lane, and power owner together. |
+| Indirect call `0x1573e674` | Driver slot `+0x28` resolves to `0x1573e870` | Execute the selected wake method. |
+| Release pair `0x1573e980..0x1573e988` | Payload `0xffffffffffffffff` at `0x19050008`, command zero at `0x19050000` | Preserve payload-before-command ordering and CPU state rules. |
+| Wake return `0x1573e678` | PDP status remains zero at this observation | Do not equate command acceptance with published completion. |
+| Poll completion `0x1573e6b0` | Marker `0xabcd9876`, consumer halfword `0x8001` | Publish the PDP result in the consumer's shared view. |
+| Cluster method `0x1573ed44..0x1573ee3c` | Both lock calls return zero. The enclosing method returns zero. | Preserve per-lane locking and failure propagation. |
+| Ordinary ID9 entry | PC `0xc6800000`, CPSR `0x89` | Keep continuation proof separate from execution of the next image. |
+
+The observer checks each executed breakpoint instruction against the selected ELF.
+It also compares the PDP halfword with the value that original QSEE loaded into `x8`.
+The observed PDP header starts with `0x80010783` and has version two at offset `0x34`.
+The current composition executes PDP firmware and disables the optional domain publisher.
+This observation therefore does not qualify a constant boot-status response.
+
+The earlier entry-state capture supplies the complementary power-owner inputs.
+It records commit true, cluster initialization true, powered-core mask one, and phase five.
+Those fields encode power status `0x0500000000000101`.
+The guarded commit read also requires the existing clock, reset, and preparation predicates.
+See `artifacts:2026-10-30-cpucp-entry-state/checks.json`.
+
+### Secure SCMI effects and limits
+
+The submission returns `-135` because the slot remains unavailable before notification.
+The captured slot remains zero, and this run proves no completed secure SCMI request.
+The native service must not reproduce that timeout as a success response.
+Its transport must preserve slot ownership, notification, response status, and completion.
+
+The original handler at CPUCP `0x1d80e750` decodes the core and cluster before selecting an effect.
+The state `0x13000` selects cluster event five, not plain CPU activation.
+At ID9 entry, the live callback lists for cluster events two through five are empty.
+The lists for cluster events zero and one contain registered callbacks.
+Core events zero and one also have callbacks, including the deferred PDP path.
+An empty event-five list does not justify a no-op for other requests.
+
+The final CPUCP snapshot records enable word `0xff` at `0x18b3026c` and running bitmap one at `0x18b30028`.
+The earlier entry-state capture records the same enable word and running bitmap zero.
+These separate observations bound the bitmap transition, but they do not identify its exact write time.
+They do not establish secondary-core activation, CPU deactivation, or every later PSCI request.
+The native implementation must retain those distinct effect boundaries.
+
+### Replay and evidence scope
+
+The evidence set is `artifacts:2026-10-30-cpu-power-group/`.
+Its observation SHA-256 is `18ccf7b9cb7277f0aa371528417623397478b58963efdcea12a7c2f0421d150b`.
+The set contains the observer, its transport helper, the run record, and compressed execution logs.
+The `SHA256SUMS` file binds those inputs and observations.
+
+Use the existing OEM preparation path from [the environment runbook](../../../../docs/environments.md).
+The observer requires the selected private inputs and the recorded system executable.
+
+```sh
+python3 observe-cpu-group.py --id9 \
+  --prepared "$PREPARED" --package "$PACKAGE" \
+  --system "$SYSTEM" --platform "$PLATFORM" \
+  --observer "$EVIDENCE" --out "$RUN"
+```
+
+The successful marker is `CPU_GROUP_OBSERVATION original-qsee-cpu-group-through-id9-entry`.
+This result qualifies the recorded boot-core sequence and the declared virtual inputs.
+It does not qualify native QEMU integration, physical reset values, Android services, or kernel execution.
+
+### Inherited debug controls and QHEE filtering
+
+The feature experiment uses the same TZ, system, and prepared inputs as the grouped CPU observation.
+QHEE has SHA-256 `1a480f0020c95fa1432f88e13543a6ebcc9521f0d3d3d67975a93cd861c9af6e`.
+Original TZ enters with `MDCR_EL3=0` and writes `0x100000` through `0xd820fed8`.
+Both the ordinary ID9 entry and the QHEE entry retain `0x100000`.
+The QHEE path also retains that value at the UEFI entry.
+
+Original QHEE enters UEFI at EL1h with `HCR_EL2.TID3=1`.
+The passive run records `HCR_EL2=0x30c807d203b`.
+The separate probe run records `0x30c807d003b` and `CPTR_EL2=0x42330000`.
+The observer executes fourteen authored EL1 `MRS` instructions through that QHEE environment.
+It temporarily replaces four nonsecure entry bytes and restores them after the probes.
+It changes no secure firmware instruction or EL3 control.
+
+The resulting guest view differs from the underlying debugger view.
+The following fields become zero.
+
+| Register | Changed field positions |
+| --- | --- |
+| `ID_AA64PFR1_EL1` | `[11:8]`, `[27:24]`, `[39:36]` |
+| `ID_AA64PFR2_EL1` | All exposed fields |
+| `ID_AA64SMFR0_EL1` | All exposed fields |
+| `ID_AA64DFR0_EL1` | `[63:60]` |
+| `ID_AA64ISAR1_EL1` | `[59:56]` |
+| `ID_AA64ISAR2_EL1` | `[3:0]`, `[55:52]`, `[59:56]`, `[63:60]` |
+| `ID_AA64MMFR3_EL1` | `[3:0]`, `[7:4]`, `[11:8]`, `[15:12]`, `[27:24]`, `[31:28]` |
+
+The guest values for ZFR0, DFR1, MMFR0, MMFR1, and MMFR2 match the debugger values.
+The guest returns PFR0 `0x1101110121111111` and ISAR0 `0x1221111110312120`.
+The debugger does not expose those two names, so this record makes no comparison for them.
+The direct ID9 path has `HCR_EL2=0` and does not inherit the QHEE filter.
+A direct continuation therefore needs a coherent CPU profile or its own EL2 policy.
+
+The evidence set is `artifacts:2026-10-30-cpu-feature-profile/`.
+It retains both passive observations, the guest probe, exact changed-bit masks, scripts, and compressed logs.
+Its `SHA256SUMS` file binds all sixteen files.
+These results describe the virtual EL1 view at the QHEE handoff, not physical-device values.
+They do not establish later kernel policy or implementation of every advertised CPU feature.
+
+Retained observations:
+
+- CPU group: `artifacts:2026-10-30-cpu-power-group/observation.json sha256=18ccf7b9cb7277f0aa371528417623397478b58963efdcea12a7c2f0421d150b`.
+- ID9 controls: `artifacts:2026-10-30-cpu-feature-profile/id9-observation.json sha256=1f2733c8a60fed872572d52677b155397ade13f2877b2b85d41ad69e0acedcfe`.
+- Guest ID reads: `artifacts:2026-10-30-cpu-feature-profile/guest-ids-observation.json sha256=da9f08be6641c0fc5a3c8f2606781ceb5c030ee3230c581de6e094340c97822f`.
+- Changed-bit masks: `artifacts:2026-10-30-cpu-feature-profile/differences.json sha256=fe00e2f3bdd5b11943831b129aebbd447ba8b7f651f15232a393bad4cc930e91`.
 

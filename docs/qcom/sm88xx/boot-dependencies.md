@@ -359,7 +359,22 @@ The deferred fabric consumer accesses bit 49 of `0x19830320 + lane*0x01000000`.
 These contracts require shared retained state, not unconditional power-transition completion.
 The deferred callback is not proof that either access executes during this initializer.
 
-### Remaining ordered groups
+### Stage chain and branch selection
+
+The six initializers are members of one chain, and the chain has three branches.
+A dispatcher at `0x156e5a88` selects the branch at every core start.
+Its only caller reaches it through `0x15679acc`.
+The dispatcher does not use its own arguments in the observed branches.
+
+| Branch | Selection at `0x156e5aa0` and `0x156e5ae8` | Contents |
+| --- | --- | --- |
+| A | `0x1567c29c() & 0xff == 1` | `0x15681f98`, `0x156e5968`, `0x156e5998`, `0x156b3724`, `0x156e5a04` |
+| B | `0x14694af8() & 0xff == 1` | `0x156e5a30`, `0x15773eb8`, `0x15772fac`, `0x156e5a5c` |
+| C | Both selectors return zero | `0x156e571c`, `0x156e5770`, `0x156e57cc`, `0x156e58d8`, `0x1574d2bc`, `0x156e5908`, `0x156e593c`, `0x1567950c` |
+
+`0x1567c29c` returns zero unconditionally, so branch A cannot run in this image.
+`0x14694af8` returns byte `0x14696cd8`, and the chain writes one to that byte at `0x15679584`.
+Branch B is therefore the per-core path after the first complete chain.
 
 Each initializer writes its stage number to marker bank `0x1580f854` (SM8850) or `0x15802e38` (SM8845) before it returns.
 The counts below are direct `bl` calls inside each function.
@@ -379,10 +394,177 @@ The counts below are direct `bl` calls inside each function.
 | SM8845 | `0x156da880` | 5 | 6 |
 | SM8845 | `0x156da8b4` | 3 | 7 |
 
-Stage five does not appear in this chain.
-The observed markers are 1, 2, 3, 4, 6, and 7. This absence is an observation, not a completed step.
+Stage five belongs to the dispatcher, not to an initializer.
+It writes five to `0x1580f854` at `0x156e5b34`, after `0x1574d2bc` and before group six.
+The dispatcher then writes nine to the same word at `0x156e5b44`.
+Thus the complete chain produces markers 1, 2, 3, 4, 5, 6, 7, and 9.
+
+**Observation:** Observations A, B, C, and D use the prepared replay with SHA-256 `91995c80f30285715dc16bc58a9337f8750bdc9f8ab7b8ed248e7fc2010c0b79`, system image `33319a6652cd149e2f50a393843aa3467c179b92f1df20361fb2518600c09686`, and the SM8850 image above.
+Observation A breaks on every direct call site and on each following instruction.
+It shows entry at all 99 call sites in order, and a return into the initializer body after the last call of each group.
+Control reached the next call site after each call, so every callee returned to its initializer.
+Observation B records both selectors with result zero, so branch C ran on the boot core.
+Observation C records branch B twice, on the two later cores.
+Observation D breaks on the predicate instructions of groups four, six, and seven and reads the result registers.
+
+**Observation:** Observation C records one boot in this order.
+The boot thread runs branch C, writes markers five and nine, and returns at `0x156e5b50`.
+It enters QHEE at `0x80000000` at `4.381 s` with `x0 = 0xc6800000` and `x1 = 2`.
+It enters UEFI at `0xc6800000` at `5.066 s`.
+Two later threads then run branch B. Thread `p01.02` enters with argument one at `5.810 s`, and thread `p01.07` enters with argument six at `6.286 s`.
+The platform log reports the core resets `apss_l0_c1` at `5.8076 s` and `apss_l1_c0` at `6.2857 s`.
+**Inference:** the argument is the logical CPU index, because each pass follows the reset of its core and cluster zero holds six cores.
+
 Further SM8845 entries `0x156da8e0`, `0x156da910`, and `0x156da97c` write markers 2, 3, and 8.
 They are separate entries. Do not insert them into the numeric chain without caller evidence.
+The branch, selector, and gate addresses above are SM8850 addresses. The SM8845 equivalents are not established here.
+
+### Third group: external service cohorts
+
+Initializer `0x156e57cc` runs 59 calls. The table groups them by the service each call reaches.
+Call numbers follow the disassembly order. Each row names the existing contract that covers the cohort.
+
+| Cohort | Calls | Identity evidence | External input and owner | Existing contract |
+| --- | --- | --- | --- | --- |
+| QUP and TLMM device setup | 1 | `QUPV3_HW_PROP`, `ssc_gpii_perms`, `/tlmm/configs` | QUP and TLMM registers, devcfg device data | `xbl-qup-firmware.lua`, `xbl-tlmm.lua`, `qsee-qup-common.lua` |
+| RPMh | 2, 27 | `0x15740314` initializer and `0x157439b0` upload | RPMh TCS at `0x18900000`, sequencer upload | [RPMh evidence](../../../models/qcom/rpmh/evidence.md) |
+| PSCI and PMIC level interface | 3, 5, 6, 43 | `cx.lvl`, `cx.tmr`, `mss.lvl`, `tzbsp_psci_cpu_boot_notifier` | PSCI handler table, PMIC rail levels | [CPU domain evidence](../../../models/qcom/sm88xx/cpucp/cpu_domain_core_evidence.md) |
+| Stub entries | 25, 44 | `0x1573a4e4` and `0x15772a88` are `bti` and `ret`, and their neighbours return `-4` | none | This row records an omission, not a service |
+| Heap, image variant, devcfg version | 4, 16, 18, 51 | `Heap is not initialized`, `IMAGE_VARIANT_STRING`, `DevCfgVersionInfo` | QSEE heap settings and version records from the QTI config | This document, first group |
+| DCP preparation | 8 | Selects operation `0x15751b9c` through `0x15751ab4` | Socinfo SMEM item `0x89`, DCP region | [DCP evidence](../../../models/qcom/sm88xx/dcp/evidence.md) |
+| ICB boot and uarb | 7, 29 | `/icb/uarb`, `/dev/icbcfg/boot` | `tz_qti_config.img` offset `0x1cfa8`, 191 records | `qsee-icb.lua`, [stubs](stubs.md) |
+| VMIDMT | 9 | `/dev/vmidmt` | `0x157665d4..0x15766770` writes | [VMIDMT evidence](../../../models/qcom/vmidmt/tz-platform-evidence.md) |
+| SMMU and crypto-engine policy | 10, 11, 12, 19 | `/dev/smmu`, `TZ_CE_POLICY_MAP`, `TZ_CE_POLICY_MAP_V2` | SMMU registers and CE policy ranges | [SMMU evidence](../../../models/qcom/smmu/evidence.md) |
+| Crypto BAM and GPI | 13, 14, 15, 24 | `CRYPTO0_CRYPTO_STATUS2 BIST_ERROR`, `iface_reg`, `gpi_iface_disable` | BAM and GPI registers | `crypto-bam.lua` |
+| TME and AC protection | 17, 37 | `/ac/xpu`, `ACLockRegionsCore`, `/ac/tz_heap`, `disable_xpu_ac` | AC configuration from XBL, TME registers | [TME protection evidence](../../../models/qcom/sm88xx/tme_protection/tz-inventory-evidence.md) |
+| SMEM target | 20 | `SMEM is not initialized by Boot.` | XBL SMEM publication at `0x01fd4000` | This document, first group |
+| VRM rail configuration | 42 | Config items `0x61`, `0x1d`, and `0x24` select handlers that name `vrm.cx`, `vrm.gfx`, and `vrm.mxg` | QTI config items and the RPMh rail resources | [RPMh evidence](../../../models/qcom/rpmh/evidence.md) |
+| PMIC and SPMI | 21, 22 | `PM_QFPROM_FLAG`, `SPMI bus busy`, `Timeout while executing SPMI transaction` | PMIC peripherals over SPMI | [SPMI evidence](../../../models/qcom/spmi/aop-discovery-evidence.md) |
+| OEM image authentication | 28, 33 | `E:No PVT_TOC`, `E:Cipher Init Fail`, `/secboot/oem_general`, `Begin UIE logging` | Signed image TOC and OEM keys | Authentication must not be stubbed |
+| DARE | 31, 39, 40 | `LCP-DARE Sec Auth Interrupt`, handler compares sentinel `0x14698fd8` with `0x800d800d` | DARE authentication interrupt | [TME protection evidence](../../../models/qcom/sm88xx/tme_protection/tz-inventory-evidence.md) |
+| CPUCP log and SCMI | 35, 36 | `CPUCP_DDRMEM`, `CPUCP_LOGBUF`, `CPUCP_RASLOG`, peer marker `0x1d83c804` | CPUCP SCMI channel at `0x1d83c400` | [CPUCP evidence](../../../models/qcom/sm88xx/cpucp/evidence.md#secure-cpu_on-operation-0x4404) |
+| GIC fault controls | 48 | `SGIFtlErr`, `SGIReset`, `CPUWakeUp` | GIC distributor `0x2e808`, `0x2e800`, `0x20048`, `0x20088` | [Architecture](architecture.md) |
+| QTimer and TCSR | 52 | `QTIMER FR3`, `QTIMER FR4`, `QTIMER FR5`, `CP15Tmr Sec` | `0x01fc0800` and QTimer frames | This document, camera TCSR subsection |
+| NOC error | 53 | `/dev/NOCError`, `/dev/NOCErrorOEM` | NOC registers from the QTI config | `qsee-icb.lua` |
+| SMP2P | 54, 55 | `/core/mproc/smp2p`, `tz2mpss_smp2p`, `ADSP`, `CDSP`, `MODEM`, `SOCCP`, `WPSS` | SMEM entries for each remote processor | This document, first group |
+| UFS ICE | 56 | `UFS ICE Interrupt`, `XTS Key`, `KS key derivation for aes xts` | ICE registers `0x01d8e200..` | This document, ICE subsection |
+| Secure camera | 50 | `seccam2_tz_init`, `CSecureCamera2_protectAll` | Camera protection bank `0x0900000c..` | This document, camera subsection |
+| TME command | 59 | `TME timed out without running command` | TME command interface | [TME mailbox evidence](../../../models/qcom/sm88xx/tme_mailbox/evidence.md) |
+| Unresolved | 23, 26, 30, 32, 34, 38, 41, 45, 46, 47, 49, 57, 58 | No subsystem string or register set establishes an identity | Unknown | Do not model these as a named block |
+
+Call 58 copies `0x26c` bytes into a stack record and passes `system-entity-qtee`, `system-entity-modem`, and `system-entity-el2` strings.
+That text supports a system-entity record. This record identifies no consumer.
+Call 26 walks a software table at `0x1580ab68` against two counters at `0x157d0698` and `0x157d069c`.
+No hardware register or service response appears in that function.
+
+Cohorts 13, 14, 15, and 24 share the crypto BAM and GPI code. Calls 13 and 14 read the crypto status word.
+Calls 15 and 24 register and deregister GPI interfaces.
+This record does not establish a completion for any of them.
+
+**Observation:** Observation A enters all 59 call sites. This establishes reachability only.
+It does not establish that a cohort completed its service, because most callees return zero for an accepted request and for an omitted step.
+
+External inputs are the QTI config records, the XBL SMEM publications, the named hardware targets, and the fused authentication data.
+Each cohort row names its owner.
+QSEE writes its own cached words itself, such as `0x1580f854`, `0x14696cd8`, `0x157f164c`, and the group-four and group-six caches.
+A platform write to those words would forge firmware state.
+
+### Group four: block state, core gate, and fuse-gated service
+
+Initializer `0x156e58d8` runs four calls after group three.
+It writes stage four to `0x1580f854` before it returns.
+
+| Order | Callee | Contract |
+| --- | --- | --- |
+| 1 | `0x157509c8` | When latch `0x157f3fb9` equals zero, it calls `0x15751b28` on object `0x157f3f90`. A zero result sets the latch to one. A nonzero result returns `-1`. When the latch equals one, it consults `0x1567c29c`, which returns zero in this image, so the latch stays at one. All of this state belongs to QSEE. |
+| 2 | `0x156794a4` | It calls `0x1567dc34`. When bit zero equals zero, control continues at `0x156c1330` by tail branch. `0x1567dc34` requires bit two of `0x15774c84` and bit zero of `0x14694d90(0,0x10)`. |
+| 3 | `0x1577a374` | It reads cached status word `0x1580d648` and queries object `0x157d3218`. A status of `0x8000000` or `0x10000000` returns unchanged. Otherwise it calls `0x1577a950` with identifier `0x4000000`, runs three sub-operations, and calls `0x1577a960` on failure. The block identity remains open. |
+| 4 | `0x156af374` | It reads fuse word `0x221c8314` bit eight. When that bit equals zero, the firmware omits the configuration service. When it equals one, the function requests a four-byte allocation for item `0x28b` through `0x15731e60` and writes `0xffff` into it. It then registers a `0x1180`-byte object at `0x157ffed8` and items `0x501`, `0x503`, `0x504`, and `0x505`. |
+
+**Observation:** Observation D reads the predicate registers of all four calls in one boot.
+Call one read latch `0x157f3fb9` as zero at `0x157509e0` and reached the latch-set site `0x15750a14` with `x8 = 1`. It therefore took the `0x15751b28` path and that call returned zero.
+Call two read `x0 = 0` after `0x15774c84` at `0x1567dc44`, so bit two equals zero and the second predicate at `0x14694d90` did not run. Control continues at `0x156c1330` by tail branch.
+Call three read the status word `0x1580d648` as zero, and `0x1577a2e8` returned an even value, so control took the skip path at `0x1577a410`. The only entry to `0x1577a950` carried `0x8000000`, so the start and stop calls for block `0x4000000` never executed.
+Call four read fuse word `0x221c8314` as `0xf`, so bit eight equals zero and control jumped to `0x156af5d8`. The allocation at `0x15731e60` and the registrations at `0x156af600` never executed.
+
+These four reads are register values. They do not depend on a debugger view of QSEE memory.
+The firmware omits the block start and the configuration service in this boot.
+Those omissions are firmware behavior, not platform policy.
+
+### Group six: region report and image identity
+
+Initializer `0x156e5908` runs five calls after the dispatcher writes stage five.
+It writes stage six to `0x1580f854` before it returns.
+
+| Order | Callee | Contract |
+| --- | --- | --- |
+| 1 | `0x15784850` | It requests a region pair through `0x15682d84`. An empty pair logs tag `0x700402` at `0x157848c0` and returns. A nonzero result of `0x157847cc` stops the core at fatal reason `0x5b` through `0x1567c2fc`. Otherwise it records the region through `0x1567ba80`, and a failure of `0x1567b708` stops the core at fatal reason `0x5c`. |
+| 2 | `0x156fd7e4` | It calls `0x156fd77c(1)` and returns zero. Software state only. |
+| 3 | `0x157a4384` | It builds a record at `0x15816d00` from immediate constants. |
+| 4 | `0x156f0960` | It branches to `0x1579c200` by tail branch. |
+| 5 | `0x15782fa4` | It returns zero when the cached pointer at `0x1580d7d0` is already nonzero. Every other exit clears that pointer. A failure path returns `-0x12c`. It uses a `0x1000`-byte buffer. |
+
+**Observation:** Two independent boots read the word at `0x1580d7d0` at `0x15782ff0`, after the guest load and before the test.
+Both reads returned zero, and the first argument was `0xd8600000` in both.
+The skip branch at `0x15782ff0` requires a nonzero word, so the normal path ran.
+The exit value `x0 = 0` cannot separate the paths, because both paths return zero.
+
+Call one obtains its pair from `0x15682d84`, which returns two QSEE-owned words.
+QSEE sets those words at `0x15682da8` from the `/tz/oem` property query at `0x1569238c`, which names the secure load-region size.
+The observed pair was `0xd8800000` and `0xe2c00000`.
+The producer is the OEM devcfg record, not the platform.
+An implementer must not write the pair and must not replace the report with an unconditional success.
+
+### Group seven: pre-handoff announcements
+
+Initializer `0x156e593c` runs three calls after group six.
+It writes stage seven to `0x1580f854` before it returns.
+
+| Order | Callee | Contract |
+| --- | --- | --- |
+| 1 | `0x15774004` | It queries `0x15685af0` and `0x15685a8c`. A nonzero answer logs tag `0x600041` or `0x600040`, and processing continues. It then calls `0x157625a0`. A zero result continues at `0x1567b5c4`. |
+| 2 | `0x15703220` | It logs tag `0x4500001` and reads software word `0x157f164c`. A nonzero word logs tag `0x4500004` with argument `0xec`. |
+| 3 | `0x156b3724` | It sets five arguments to zero, zero, one, zero, and zero, and branches to `0x1576ffbc`. |
+
+The two queries read `/tz/oem` devcfg properties.
+`0x15685af0` uses `0x15692f2c` and `0x15693194`, which read the TA whitelist and SKU records.
+`0x15685a8c` uses `0x15692e6c` and `0x1569599c`, which read the MRC activation records.
+The producer is the QTI config image, which enters the replay as a selected input.
+
+**Observation:** Observation D reads `x0 = 0` after both queries.
+Neither log ran in this boot.
+It does not read the word at `0x157f164c`, because the site after that load was not reached in the observation window.
+QSEE writes that word at `0x15703038` in the same module, so it is QSEE state and not a platform input.
+
+This record establishes the call reachability and the two query results.
+It does not trace the full subtree of the two callees, so it does not establish a hardware completion or its absence.
+
+### Chain tail and nonsecure handoff
+
+Branch C calls `0x1567950c` after group seven at `0x156e5b40`.
+That function publishes the running core and then sets the gate byte.
+
+1. It clears a `0x70`-byte record selected from table `0x157f9708` by the CPU index.
+2. It sets byte `0x14691008 + index` to one.
+3. It calls `0x1567fca4`, `0x1567f284`, `0x1567c2dc`, `0x15679594`, and `0x1567bd68`.
+4. It writes one to `0x14696cd8` at `0x15679584`.
+
+**Observation:** Observation C records the entry of `0x1567950c` at `4.378 s`, the marker-nine write, and the dispatcher return to `0x15679ad0`.
+The QHEE and UEFI entries follow on the same thread.
+A stage marker and a breakpoint establish control flow only.
+They do not establish that QHEE, UEFI, or the kernel accepted a service result.
+
+The CPU start path is separate from these initializers.
+No direct call from any initializer reaches `0x1573e608` or `0x1573e870`.
+Static table `0x157f2c40` holds those methods, and slot `+0x28` is `0x1573e870`.
+See [the CPU domain evidence](../../../models/qcom/sm88xx/cpucp/cpu_domain_core_evidence.md) for that contract.
+
+The retained evidence binds the observations and their limits:
+
+- Findings: `artifacts:2026-10-30-qsee-init-groups/findings.json sha256=f7a540fbf63426f982d116d99b21801021ce95674a2844c93975076d27d829ec`.
+- Call sequence: `artifacts:2026-10-30-qsee-init-groups/runA-observation.json sha256=4afe34db3305ee0cd19e3bd552eae43a7ebe40fdbd68497ac236490ebcd37a05`.
+- Handoff order: `artifacts:2026-10-30-qsee-init-groups/runC-observation.json sha256=7bb2c5c73d2a9573a7e2650a3d17687288374b9d653f21ce5d00b80229ef05b9`.
+- Predicate values: `artifacts:2026-10-30-qsee-init-groups/runD-observation.json sha256=9012e899ef9feefc7a5f2bdefd42b177fd43a9e68fc722b7a4d8c327bfdf15b7`.
 
 ### Secure-camera protection bank
 
